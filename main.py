@@ -2,18 +2,23 @@
 Weg. Backend — echter Server mit Gedächtnis.
 
 Löst zwei Dinge, die eine reine HTML-Datei nicht kann:
-1. Alles wird dauerhaft gespeichert (SQLite-Datenbank statt Browser-Variable,
-   die beim Schliessen verschwindet).
+1. Alles wird dauerhaft gespeichert — über eine echte Postgres-Datenbank
+   (z.B. Supabase), NICHT über die lokale Festplatte des Servers. Wichtig:
+   Render's kostenloses Tier hat ein "flüchtiges" Dateisystem — jede lokale
+   Datei (inkl. einer SQLite-Datenbank) geht bei Neustart/Redeploy verloren.
+   Deshalb Postgres über DATABASE_URL, nicht SQLite, sobald deployed.
 2. Der Chat/die Zielzerlegung läuft über die echte Anthropic API, mit der
-   gesamten bisherigen Journal-/Ziel-/Aufgaben-Historie als Kontext — statt
-   der 5 fest programmierten Kategorien aus dem Vorgänger-Prototyp.
+   gesamten bisherigen Journal-/Ziel-/Aufgaben-Historie als Kontext.
 
-Starten (lokal):
+Starten (lokal, ohne eigene Postgres-Datenbank — nutzt automatisch SQLite):
     pip install -r requirements.txt
     export ANTHROPIC_API_KEY=dein-api-key
     uvicorn main:app --reload --port 8000
 
-Siehe README.md für Details, inkl. kostenloser Deployment-Optionen.
+Starten (mit echter Postgres-Datenbank, z.B. Supabase — für Render-Deploy):
+    zusätzlich: export DATABASE_URL=postgres://... (von Supabase kopiert)
+
+Siehe README.md für Details zum Supabase-Setup.
 """
 
 from __future__ import annotations
@@ -21,22 +26,29 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+import bcrypt
 import httpx
-from fastapi import FastAPI, HTTPException
+import jwt
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 DB_PATH = os.environ.get("WEG_DB_PATH", "weg.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USE_POSTGRES = bool(DATABASE_URL)
+
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_DAYS = 30
+
 app = FastAPI(title="Weg. Backend")
 
-# Für den Prototyp offen für alle Origins — vor echtem Launch einschränken
-# auf die tatsächliche Domain der Frontend-Seite.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,31 +58,105 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Datenbank
+# Datenbank — Postgres (production/Render) oder SQLite (lokal, Fallback)
 # ---------------------------------------------------------------------------
 
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+if USE_POSTGRES:
+    import psycopg2
+    import psycopg2.extras
 
+    @contextmanager
+    def get_db():
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
-def init_db() -> None:
-    with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL,          -- 'goal' | 'priority' | 'task' | 'journal' | 'chat_user' | 'chat_assistant'
-                content TEXT NOT NULL,
-                done INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-        """)
+    def init_db() -> None:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS entries (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    done BOOLEAN DEFAULT FALSE,
+                    created_at TEXT NOT NULL
+                )
+            """)
+
+    def run_query(conn, query: str, params: tuple = ()):
+        """Führt eine Query aus und gibt eine Liste von dicts zurück (SELECT)."""
+        pg_query = query.replace("?", "%s")
+        cur = conn.cursor()
+        cur.execute(pg_query, params)
+        try:
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+        except psycopg2.ProgrammingError:
+            return []
+
+    def run_write(conn, query: str, params: tuple = ()):
+        """Führt INSERT/UPDATE/DELETE aus, gibt bei INSERT die neue id zurück."""
+        pg_query = query.replace("?", "%s")
+        if pg_query.strip().upper().startswith("INSERT"):
+            pg_query += " RETURNING id"
+        cur = conn.cursor()
+        cur.execute(pg_query, params)
+        if pg_query.strip().upper().startswith("INSERT"):
+            return cur.fetchone()["id"]
+        return None
+
+else:
+    @contextmanager
+    def get_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def init_db() -> None:
+        with get_db() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    done INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """)
+
+    def run_query(conn, query: str, params: tuple = ()):
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def run_write(conn, query: str, params: tuple = ()):
+        cur = conn.execute(query, params)
+        return cur.lastrowid
 
 
 init_db()
@@ -98,6 +184,16 @@ class GoalIn(BaseModel):
     goal: str
 
 
+class SignupIn(BaseModel):
+    email: str
+    password: str
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen
 # ---------------------------------------------------------------------------
@@ -106,31 +202,73 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def fetch_entries(conn, type_filter: Optional[str] = None, limit: int = 200):
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+
+
+def create_token(user_id: int, email: str) -> str:
+    if not JWT_SECRET:
+        raise HTTPException(status_code=500, detail="JWT_SECRET ist nicht gesetzt. Siehe README.md.")
+    payload = {
+        "user_id": user_id,
+        "email": email,
+        "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRY_DAYS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def get_current_user(authorization: str = Header(None)) -> dict:
+    """
+    Liest den 'Authorization: Bearer <token>'-Header, prüft das Token,
+    gibt {user_id, email} zurück. Wird als Depends() an jeden geschützten
+    Endpoint gehängt, damit jede Anfrage weiss, wem die Daten gehören.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Nicht eingeloggt.")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not JWT_SECRET:
+        raise HTTPException(status_code=500, detail="JWT_SECRET ist nicht gesetzt. Siehe README.md.")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Sitzung abgelaufen, bitte neu einloggen.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Ungültiges Login-Token.")
+    return {"user_id": payload["user_id"], "email": payload["email"]}
+
+
+def fetch_entries(conn, user_id: int, type_filter: Optional[str] = None, limit: int = 200):
     if type_filter:
-        rows = conn.execute(
-            "SELECT * FROM entries WHERE type = ? ORDER BY id DESC LIMIT ?",
-            (type_filter, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM entries ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-    return [dict(r) for r in rows]
+        return run_query(
+            conn,
+            "SELECT * FROM entries WHERE user_id = ? AND type = ? ORDER BY id DESC LIMIT ?",
+            (user_id, type_filter, limit),
+        )
+    return run_query(
+        conn, "SELECT * FROM entries WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)
+    )
 
 
-def build_memory_context(conn) -> str:
+def fetch_entries_by_types(conn, user_id: int, types: list[str], limit: int = 200):
+    placeholders = ",".join("?" for _ in types)
+    query = f"SELECT * FROM entries WHERE user_id = ? AND type IN ({placeholders}) ORDER BY id DESC LIMIT ?"
+    return run_query(conn, query, (user_id, *types, limit))
+
+
+def build_memory_context(conn, user_id: int) -> str:
     """
-    Baut eine kompakte Zusammenfassung der bisherigen Historie, die als
-    Kontext an Claude mitgegeben wird — das ist das eigentliche "Gedächtnis".
+    Baut eine kompakte Zusammenfassung der bisherigen Historie EINER Person,
+    die als Kontext an Claude mitgegeben wird — das eigentliche "Gedächtnis".
     """
-    goals = fetch_entries(conn, "goal", limit=10)
-    journal = fetch_entries(conn, "journal", limit=10)
-    tasks = fetch_entries(conn, "task", limit=20)
-    chat = conn.execute(
-        "SELECT * FROM entries WHERE type IN ('chat_user','chat_assistant') ORDER BY id DESC LIMIT 20"
-    ).fetchall()
-    chat = list(reversed([dict(r) for r in chat]))
+    goals = fetch_entries(conn, user_id, "goal", limit=10)
+    journal = fetch_entries(conn, user_id, "journal", limit=10)
+    tasks = fetch_entries(conn, user_id, "task", limit=20)
+    chat = fetch_entries_by_types(conn, user_id, ["chat_user", "chat_assistant"], limit=20)
+    chat = list(reversed(chat))
 
     parts = []
     if goals:
@@ -213,69 +351,128 @@ Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@app.get("/entries")
-def list_entries(type: Optional[str] = None):
+# ---------------------------------------------------------------------------
+# Auth-Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/signup")
+def signup(payload: SignupIn):
+    email = payload.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Ungültige E-Mail-Adresse.")
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Passwort muss mindestens 8 Zeichen haben.")
+
     with get_db() as conn:
-        return fetch_entries(conn, type)
+        existing = run_query(conn, "SELECT id FROM users WHERE email = ?", (email,))
+        if existing:
+            raise HTTPException(status_code=409, detail="Diese E-Mail ist bereits registriert.")
+
+        password_hash = hash_password(payload.password)
+        user_id = run_write(
+            conn,
+            "INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
+            (email, password_hash, now_iso()),
+        )
+
+    token = create_token(user_id, email)
+    return {"token": token, "email": email}
+
+
+@app.post("/auth/login")
+def login(payload: LoginIn):
+    email = payload.email.strip().lower()
+    with get_db() as conn:
+        rows = run_query(conn, "SELECT * FROM users WHERE email = ?", (email,))
+
+    if not rows or not verify_password(payload.password, rows[0]["password_hash"]):
+        raise HTTPException(status_code=401, detail="E-Mail oder Passwort falsch.")
+
+    user = rows[0]
+    token = create_token(user["id"], user["email"])
+    return {"token": token, "email": user["email"]}
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — jeweils mit user = Depends(get_current_user) geschützt,
+# jede Anfrage ist automatisch auf die Daten der eingeloggten Person beschränkt
+# ---------------------------------------------------------------------------
+
+@app.get("/entries")
+def list_entries(type: Optional[str] = None, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        return fetch_entries(conn, user["user_id"], type)
 
 
 @app.post("/entries")
-def create_entry(entry: EntryIn):
+def create_entry(entry: EntryIn, user: dict = Depends(get_current_user)):
     with get_db() as conn:
-        cur = conn.execute(
-            "INSERT INTO entries (type, content, done, created_at) VALUES (?, ?, 0, ?)",
-            (entry.type, entry.content, now_iso()),
+        new_id = run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, ?, ?, 0, ?)",
+            (user["user_id"], entry.type, entry.content, now_iso()),
         )
-        return {"id": cur.lastrowid}
+        return {"id": new_id}
 
 
 @app.patch("/entries/{entry_id}")
-def update_entry(entry_id: int, update: EntryUpdate):
+def update_entry(entry_id: int, update: EntryUpdate, user: dict = Depends(get_current_user)):
     with get_db() as conn:
         if update.done is not None:
-            conn.execute("UPDATE entries SET done = ? WHERE id = ?", (int(update.done), entry_id))
+            run_write(
+                conn,
+                "UPDATE entries SET done = ? WHERE id = ? AND user_id = ?",
+                (update.done, entry_id, user["user_id"]),
+            )
         if update.content is not None:
-            conn.execute("UPDATE entries SET content = ? WHERE id = ?", (update.content, entry_id))
+            run_write(
+                conn,
+                "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
+                (update.content, entry_id, user["user_id"]),
+            )
         return {"ok": True}
 
 
 @app.delete("/entries/{entry_id}")
-def delete_entry(entry_id: int):
+def delete_entry(entry_id: int, user: dict = Depends(get_current_user)):
     with get_db() as conn:
-        conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+        run_write(conn, "DELETE FROM entries WHERE id = ? AND user_id = ?", (entry_id, user["user_id"]))
         return {"ok": True}
 
 
 @app.post("/chat")
-async def chat(payload: ChatIn):
+async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     with get_db() as conn:
-        memory = build_memory_context(conn)
-        conn.execute(
-            "INSERT INTO entries (type, content, done, created_at) VALUES ('chat_user', ?, 0, ?)",
-            (payload.message, now_iso()),
+        memory = build_memory_context(conn, user["user_id"])
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_user', ?, 0, ?)",
+            (user["user_id"], payload.message, now_iso()),
         )
 
     system_prompt = f"{MENTOR_SYSTEM_PROMPT}\n\n--- Bisherige Historie der Person ---\n{memory}"
     answer = await call_claude(system_prompt, payload.message)
 
     with get_db() as conn:
-        conn.execute(
-            "INSERT INTO entries (type, content, done, created_at) VALUES ('chat_assistant', ?, 0, ?)",
-            (answer, now_iso()),
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_assistant', ?, 0, ?)",
+            (user["user_id"], answer, now_iso()),
         )
 
     return {"answer": answer}
 
 
 @app.post("/goal/decompose")
-async def decompose_goal(payload: GoalIn):
+async def decompose_goal(payload: GoalIn, user: dict = Depends(get_current_user)):
     import json
 
     with get_db() as conn:
-        memory = build_memory_context(conn)
-        conn.execute(
-            "INSERT INTO entries (type, content, done, created_at) VALUES ('goal', ?, 0, ?)",
-            (payload.goal, now_iso()),
+        memory = build_memory_context(conn, user["user_id"])
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'goal', ?, 0, ?)",
+            (user["user_id"], payload.goal, now_iso()),
         )
 
     system_prompt = f"{GOAL_SYSTEM_PROMPT}\n\n--- Bisherige Historie der Person ---\n{memory}"
@@ -289,14 +486,16 @@ async def decompose_goal(payload: GoalIn):
 
     with get_db() as conn:
         for p in parsed.get("prioritaeten", []):
-            conn.execute(
-                "INSERT INTO entries (type, content, done, created_at) VALUES ('priority', ?, 0, ?)",
-                (p, now_iso()),
+            run_write(
+                conn,
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'priority', ?, 0, ?)",
+                (user["user_id"], p, now_iso()),
             )
         for t in parsed.get("aufgaben", []):
-            conn.execute(
-                "INSERT INTO entries (type, content, done, created_at) VALUES ('task', ?, 0, ?)",
-                (t, now_iso()),
+            run_write(
+                conn,
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'task', ?, 0, ?)",
+                (user["user_id"], t, now_iso()),
             )
 
     return parsed
@@ -304,4 +503,8 @@ async def decompose_goal(payload: GoalIn):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "api_key_configured": bool(ANTHROPIC_API_KEY)}
+    return {
+        "status": "ok",
+        "api_key_configured": bool(ANTHROPIC_API_KEY),
+        "jwt_secret_configured": bool(JWT_SECRET),
+    }
