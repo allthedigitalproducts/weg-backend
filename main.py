@@ -409,7 +409,7 @@ def create_entry(entry: EntryIn, user: dict = Depends(get_current_user)):
     with get_db() as conn:
         new_id = run_write(
             conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, ?, ?, 0, ?)",
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, ?, ?, FALSE, ?)",
             (user["user_id"], entry.type, entry.content, now_iso()),
         )
         return {"id": new_id}
@@ -446,7 +446,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         memory = build_memory_context(conn, user["user_id"])
         run_write(
             conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_user', ?, 0, ?)",
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_user', ?, FALSE, ?)",
             (user["user_id"], payload.message, now_iso()),
         )
 
@@ -456,7 +456,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     with get_db() as conn:
         run_write(
             conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_assistant', ?, 0, ?)",
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_assistant', ?, FALSE, ?)",
             (user["user_id"], answer, now_iso()),
         )
 
@@ -471,7 +471,7 @@ async def decompose_goal(payload: GoalIn, user: dict = Depends(get_current_user)
         memory = build_memory_context(conn, user["user_id"])
         run_write(
             conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'goal', ?, 0, ?)",
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'goal', ?, FALSE, ?)",
             (user["user_id"], payload.goal, now_iso()),
         )
 
@@ -488,13 +488,13 @@ async def decompose_goal(payload: GoalIn, user: dict = Depends(get_current_user)
         for p in parsed.get("prioritaeten", []):
             run_write(
                 conn,
-                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'priority', ?, 0, ?)",
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'priority', ?, FALSE, ?)",
                 (user["user_id"], p, now_iso()),
             )
         for t in parsed.get("aufgaben", []):
             run_write(
                 conn,
-                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'task', ?, 0, ?)",
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'task', ?, FALSE, ?)",
                 (user["user_id"], t, now_iso()),
             )
 
