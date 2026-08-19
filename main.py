@@ -47,7 +47,7 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 30
 
-app = FastAPI(title="Weg. Backend")
+app = FastAPI(title="Sole. Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -318,7 +318,7 @@ async def call_claude(system_prompt: str, user_message: str) -> str:
     return "\n".join(text_blocks) if text_blocks else "(keine Antwort erhalten)"
 
 
-MENTOR_SYSTEM_PROMPT = """Du bist der "Weg."-Mentor, ein persönlicher Struktur-Begleiter für jemanden, \
+MENTOR_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor, ein persönlicher Struktur-Begleiter für jemanden, \
 der gerade den Übergang von einer Festanstellung in die Selbständigkeit in der Schweiz durchläuft.
 
 Du kennst die bisherige Geschichte der Person (Ziele, Aufgaben, Journal-Einträge) — nutze das aktiv, \
@@ -333,7 +333,7 @@ Steuerberatung. Bei unklaren Einzelfällen auf RAV/Ausgleichskasse/Treuhänder v
 - Erfinde keine Fakten über die Person, die nicht im Kontext stehen."""
 
 
-GOAL_SYSTEM_PROMPT = """Du bist der "Weg."-Ziel-Agent. Die Person beschreibt ein Ziel für die Woche \
+GOAL_SYSTEM_PROMPT = """Du bist der "Sole."-Ziel-Agent. Die Person beschreibt ein Ziel für die Woche \
 oder den Monat. Zerlege es in genau 3 konkrete Prioritäten und pro Priorität 1-2 sofort umsetzbare \
 Aufgaben. Berücksichtige die bisherige Historie der Person, falls relevant (z.B. keine Aufgabe \
 vorschlagen, die laut Historie schon erledigt ist).
