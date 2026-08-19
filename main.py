@@ -192,6 +192,7 @@ class EntryUpdate(BaseModel):
 
 class ChatIn(BaseModel):
     message: str
+    mode: Optional[str] = None  # "onboarding" erzwingt das Kennenlern-Gespräch
 
 
 class GoalIn(BaseModel):
@@ -278,21 +279,45 @@ def build_memory_context(conn, user_id: int) -> str:
     Baut eine kompakte Zusammenfassung der bisherigen Historie EINER Person,
     die als Kontext an Claude mitgegeben wird — das eigentliche "Gedächtnis".
     """
+    import json
+
+    profile = fetch_entries(conn, user_id, "profile", limit=1)
     journal = fetch_entries(conn, user_id, "journal", limit=10)
     tasks = fetch_entries(conn, user_id, "task", limit=30)
-    vision = fetch_entries(conn, user_id, "vision", limit=1)
-    projects = fetch_entries(conn, user_id, "project", limit=10)
+    overall_vision = fetch_entries(conn, user_id, "overall_vision", limit=1)
+    ventures_raw = fetch_entries(conn, user_id, "venture", limit=20)
     chat = fetch_entries_by_types(conn, user_id, ["chat_user", "chat_assistant"], limit=20)
     chat = list(reversed(chat))
 
     parts = []
-    if vision:
-        parts.append("Strategisches Ziel / Vision der Person:\n" + vision[0]["content"])
-    if projects:
-        parts.append(
-            "Aktuelle Projekte (Teil der Strategie):\n"
-            + "\n".join(f"- {p['content']}" for p in projects)
-        )
+    if profile:
+        try:
+            p = json.loads(profile[0]["content"])
+            parts.append(
+                "Profil der Person (zuletzt aktualisiert: " + profile[0]["created_at"][:10] + "):\n"
+                f"- Name/Anrede: {p.get('name', '-')}\n"
+                f"- Situation: {p.get('situation', '-')}\n"
+                f"- Vision/Warum: {p.get('vision', '-')}\n"
+                f"- Aktuelle Sorge: {p.get('sorge', '-')}\n"
+                f"- Gewünschter Kommunikationsstil: {p.get('stil', '-')}"
+            )
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if overall_vision:
+        parts.append("Übergeordnete strategische Vision der Person:\n" + overall_vision[0]["content"])
+    if ventures_raw:
+        venture_lines = []
+        for v in ventures_raw:
+            try:
+                data = json.loads(v["content"])
+                line = f"- {data.get('name', 'unbenannt')}: {data.get('vision', '')}"
+                if data.get("meilensteine"):
+                    line += f" (Meilensteine: {data['meilensteine']})"
+                venture_lines.append(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if venture_lines:
+            parts.append("Standbeine/Geschäftsfelder der Person:\n" + "\n".join(venture_lines))
     if tasks:
         offen = [t for t in tasks if not t["done"]]
         erledigt = [t for t in tasks if t["done"]]
@@ -376,6 +401,13 @@ Weitere Regeln:
 - Bei RAV/AHV/Steuerfragen: allgemeine Informationen ja, aber keine verbindliche Rechts- oder \
 Steuerberatung. Bei unklaren Einzelfällen auf RAV/Ausgleichskasse/Treuhänder verweisen.
 - Erfinde keine Fakten über die Person, die nicht im Kontext stehen.
+- Falls im Kontext ein Profil der Person vorhanden ist (Name, Situation, Vision, Sorge, \
+gewünschter Kommunikationsstil): nutze den Namen zur Anrede, passe deinen Ton an den \
+gewünschten Stil an, und beziehe dich bei Gelegenheit auf die genannte Sorge/Vision.
+- Falls das Profil laut Kontext schon länger nicht aktualisiert wurde (mehrere Wochen) UND die \
+aktuelle Nachricht Hinweise auf eine veränderte Situation gibt (z.B. neue Rolle, grosser Wechsel \
+erwähnt): frag beiläufig, ob sich an der Grundsituation etwas geändert hat - aber nicht bei jeder \
+Nachricht, nur wenn es wirklich passt.
 
 Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
 {
@@ -388,8 +420,53 @@ Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
 Falls keine Aufgaben erkennbar sind: "neue_aufgaben": []"""
 
 
-STRATEGY_SYSTEM_PROMPT = """Du hilfst dabei, die strategische Vision einer Person zu schärfen, die \
-sich selbständig macht. Die Person gibt einen groben, evtl. unstrukturierten Text zu ihrer Vision. \
+ONBOARDING_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Das ist die ALLERERSTE Unterhaltung mit \
+dieser Person - du kennst sie noch nicht. Bevor du in den normalen Sparring-/Braindump-Modus gehst, \
+führst du ein kurzes, persönliches Kennenlern-Gespräch, wie wenn man einen neuen Mentor/Chief of \
+Staff trifft.
+
+Stell GENAU EINE Frage pro Nachricht, warte auf die Antwort, dann die nächste - nie mehrere Fragen \
+auf einmal. Die fünf Bereiche, die du nacheinander abdecken willst (schau in der bisherigen \
+Chat-Historie, was schon beantwortet wurde, und frag nur noch das Fehlende):
+
+1. Wie die Person genannt werden möchte (Name/Anrede)
+2. Die aktuelle Situation (z.B. noch angestellt, RAV, schon voll selbständig, wo genau im Prozess)
+3. Die grundlegende Vision/das "Warum" hinter der Selbständigkeit
+4. Was die Person gerade am meisten beschäftigt oder ihr Sorgen macht
+5. Gewünschter Umgangston (eher direkt & herausfordernd, oder eher sanft & ermutigend)
+
+Sobald alle fünf Bereiche abgedeckt sind: fasse kurz zusammen, was du verstanden hast, und frag \
+explizit nach Bestätigung ("Hab ich das richtig verstanden? ..."). Erst wenn die Person bestätigt \
+(z.B. "ja", "passt", "stimmt so"), gibst du das strukturierte Profil im JSON zurück (siehe unten) - \
+vorher immer "profil": null.
+
+Halte den Ton warm, persönlich, aber zielgerichtet - das ist ein Kennenlernen, kein Verhör.
+
+Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
+{
+  "antwort": "deine Frage oder Zusammenfassung, kann Markdown enthalten",
+  "neue_aufgaben": [],
+  "profil": null
+}
+Erst nach expliziter Bestätigung durch die Person, im selben Format aber mit ausgefülltem profil:
+{
+  "antwort": "kurze, warme Bestätigung, dass ihr jetzt startklar seid",
+  "neue_aufgaben": [],
+  "profil": {
+    "name": "...",
+    "situation": "...",
+    "vision": "...",
+    "sorge": "...",
+    "stil": "..."
+  }
+}"""
+
+
+STRATEGY_SYSTEM_PROMPT = """Du hilfst dabei, die übergeordnete Vision einer Person zu schärfen, die \
+sich selbständig macht — möglicherweise mit mehreren gleichzeitigen Standbeinen/Geschäftsfeldern. \
+Die Person gibt einen groben, evtl. unstrukturierten Text zu ihrer übergeordneten Vision. Falls \
+bereits einzelne Standbeine bekannt sind (im Kontext aufgeführt), geh in der geschärften Vision \
+darauf ein - wie hängen die Standbeine zusammen, was ist das verbindende "Warum" dahinter. \
 Formuliere daraus 2-4 klare, prägnante Sätze, die den Kern erfassen - nicht länger, nicht \
 ausschmückender als nötig. Antworte NUR mit dem geschärften Text, ohne Anführungszeichen, ohne \
 zusätzliche Erklärung."""
@@ -506,13 +583,15 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
 
     with get_db() as conn:
         memory = build_memory_context(conn, user["user_id"])
+        has_profile = bool(fetch_entries(conn, user["user_id"], "profile", limit=1))
         run_write(
             conn,
             "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_user', ?, FALSE, ?)",
             (user["user_id"], payload.message, now_iso()),
         )
 
-    system_prompt = f"{MENTOR_SYSTEM_PROMPT}\n\n--- Bisherige Historie der Person ---\n{memory}"
+    base_prompt = ONBOARDING_SYSTEM_PROMPT if (not has_profile or payload.mode == "onboarding") else MENTOR_SYSTEM_PROMPT
+    system_prompt = f"{base_prompt}\n\n--- Bisherige Historie der Person ---\n{memory}"
     raw = await call_claude(system_prompt, payload.message)
 
     try:
@@ -520,11 +599,13 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         parsed = json.loads(cleaned)
         antwort = parsed.get("antwort", raw)
         neue_aufgaben = parsed.get("neue_aufgaben", [])
+        neues_profil = parsed.get("profil")
     except (json.JSONDecodeError, AttributeError):
-        # Falls das Parsen fehlschlägt, nutzen wir die Rohantwort ohne Aufgaben-Extraktion,
+        # Falls das Parsen fehlschlägt, nutzen wir die Rohantwort ohne Extraktion,
         # damit der Chat trotzdem funktioniert, statt komplett zu scheitern.
         antwort = raw
         neue_aufgaben = []
+        neues_profil = None
 
     with get_db() as conn:
         run_write(
@@ -546,53 +627,144 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
             )
             erstellte_aufgaben.append(inhalt)
 
-    return {"answer": antwort, "neue_aufgaben": erstellte_aufgaben}
+        profil_gespeichert = False
+        if isinstance(neues_profil, dict) and neues_profil:
+            run_write(
+                conn,
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'profile', ?, FALSE, ?)",
+                (user["user_id"], json.dumps(neues_profil, ensure_ascii=False), now_iso()),
+            )
+            profil_gespeichert = True
+
+    return {
+        "answer": antwort,
+        "neue_aufgaben": erstellte_aufgaben,
+        "onboarding": (not has_profile) or (payload.mode == "onboarding"),
+        "profil_gespeichert": profil_gespeichert,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Strategy-Endpoints — Vision + Projekte, der "Kompass"
 # ---------------------------------------------------------------------------
 
-@app.get("/strategy")
-def get_strategy(user: dict = Depends(get_current_user)):
+# ---------------------------------------------------------------------------
+# Profil-Endpoints — für die editierbare Profil-Seite
+# ---------------------------------------------------------------------------
+
+class ProfileIn(BaseModel):
+    name: str = ""
+    situation: str = ""
+    vision: str = ""
+    sorge: str = ""
+    stil: str = ""
+
+
+@app.get("/profile")
+def get_profile(user: dict = Depends(get_current_user)):
+    import json
+
     with get_db() as conn:
-        vision = fetch_entries(conn, user["user_id"], "vision", limit=1)
-        projects = fetch_entries(conn, user["user_id"], "project", limit=20)
-    return {
-        "vision": vision[0]["content"] if vision else "",
-        "projects": projects,
-    }
+        profile = fetch_entries(conn, user["user_id"], "profile", limit=1)
+    if not profile:
+        return {"exists": False, "name": "", "situation": "", "vision": "", "sorge": "", "stil": ""}
+    try:
+        data = json.loads(profile[0]["content"])
+    except (json.JSONDecodeError, TypeError):
+        data = {}
+    return {"exists": True, **{k: data.get(k, "") for k in ["name", "situation", "vision", "sorge", "stil"]}}
 
 
-@app.post("/strategy/vision")
-async def set_vision(payload: GoalIn, user: dict = Depends(get_current_user)):
-    """Nimmt einen groben Vision-Text entgegen, lässt ihn von Claude schärfen, speichert ihn."""
-    refined = await call_claude(STRATEGY_SYSTEM_PROMPT, payload.goal)
+@app.post("/profile")
+def set_profile(payload: ProfileIn, user: dict = Depends(get_current_user)):
+    import json
+
     with get_db() as conn:
         run_write(
             conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'vision', ?, FALSE, ?)",
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'profile', ?, FALSE, ?)",
+            (user["user_id"], json.dumps(payload.model_dump(), ensure_ascii=False), now_iso()),
+        )
+    return {"ok": True}
+
+
+class VentureIn(BaseModel):
+    name: str
+    vision: str = ""
+    meilensteine: str = ""
+
+
+@app.get("/strategy")
+def get_strategy(user: dict = Depends(get_current_user)):
+    import json
+
+    with get_db() as conn:
+        overall_vision = fetch_entries(conn, user["user_id"], "overall_vision", limit=1)
+        ventures_raw = fetch_entries(conn, user["user_id"], "venture", limit=20)
+
+    ventures = []
+    for v in ventures_raw:
+        try:
+            data = json.loads(v["content"])
+            data["id"] = v["id"]
+            ventures.append(data)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return {
+        "overall_vision": overall_vision[0]["content"] if overall_vision else "",
+        "ventures": ventures,
+    }
+
+
+@app.post("/strategy/overall-vision")
+async def set_overall_vision(payload: GoalIn, user: dict = Depends(get_current_user)):
+    """Nimmt einen groben Vision-Text entgegen, lässt ihn von Claude schärfen, speichert ihn.
+    Bezieht bestehende Standbeine als Kontext mit ein, damit die geschärfte Vision darauf eingeht."""
+    import json
+
+    with get_db() as conn:
+        ventures_raw = fetch_entries(conn, user["user_id"], "venture", limit=20)
+    venture_names = []
+    for v in ventures_raw:
+        try:
+            venture_names.append(json.loads(v["content"]).get("name", ""))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    context = ""
+    if venture_names:
+        context = "\n\n(Bekannte Standbeine der Person: " + ", ".join(venture_names) + ")"
+
+    refined = await call_claude(STRATEGY_SYSTEM_PROMPT, payload.goal + context)
+    with get_db() as conn:
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'overall_vision', ?, FALSE, ?)",
             (user["user_id"], refined, now_iso()),
         )
-    return {"vision": refined}
+    return {"overall_vision": refined}
 
 
-@app.post("/strategy/project")
-def add_project(entry: EntryIn, user: dict = Depends(get_current_user)):
+@app.post("/strategy/venture")
+def add_venture(payload: VentureIn, user: dict = Depends(get_current_user)):
+    import json
+
+    content = json.dumps(payload.model_dump(exclude={"id"}, exclude_unset=False), ensure_ascii=False)
     with get_db() as conn:
         new_id = run_write(
             conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'project', ?, FALSE, ?)",
-            (user["user_id"], entry.content, now_iso()),
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'venture', ?, FALSE, ?)",
+            (user["user_id"], content, now_iso()),
         )
     return {"id": new_id}
 
 
-@app.delete("/strategy/project/{project_id}")
-def delete_project(project_id: int, user: dict = Depends(get_current_user)):
+@app.delete("/strategy/venture/{venture_id}")
+def delete_venture(venture_id: int, user: dict = Depends(get_current_user)):
     with get_db() as conn:
         run_write(
-            conn, "DELETE FROM entries WHERE id = ? AND user_id = ?", (project_id, user["user_id"])
+            conn, "DELETE FROM entries WHERE id = ? AND user_id = ?", (venture_id, user["user_id"])
         )
     return {"ok": True}
 
