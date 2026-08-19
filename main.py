@@ -92,9 +92,14 @@ if USE_POSTGRES:
                     type TEXT NOT NULL,
                     content TEXT NOT NULL,
                     done BOOLEAN DEFAULT FALSE,
+                    parent_id INTEGER,
+                    due_date TEXT,
                     created_at TEXT NOT NULL
                 )
             """)
+            # Migration-safe: falls die Tabelle schon vorher ohne diese Spalten existierte
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS parent_id INTEGER")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS due_date TEXT")
 
     def run_query(conn, query: str, params: tuple = ()):
         """Führt eine Query aus und gibt eine Liste von dicts zurück (SELECT)."""
@@ -146,9 +151,17 @@ else:
                     type TEXT NOT NULL,
                     content TEXT NOT NULL,
                     done INTEGER DEFAULT 0,
+                    parent_id INTEGER,
+                    due_date TEXT,
                     created_at TEXT NOT NULL
                 )
             """)
+            # Migration-safe: falls die Tabelle schon vorher ohne diese Spalten existierte
+            for col_def in ["parent_id INTEGER", "due_date TEXT"]:
+                try:
+                    conn.execute(f"ALTER TABLE entries ADD COLUMN {col_def}")
+                except sqlite3.OperationalError:
+                    pass  # Spalte existiert schon
 
     def run_query(conn, query: str, params: tuple = ()):
         rows = conn.execute(query, params).fetchall()
@@ -169,6 +182,7 @@ init_db()
 class EntryIn(BaseModel):
     type: str
     content: str
+    due_date: Optional[str] = None
 
 
 class EntryUpdate(BaseModel):
@@ -264,25 +278,31 @@ def build_memory_context(conn, user_id: int) -> str:
     Baut eine kompakte Zusammenfassung der bisherigen Historie EINER Person,
     die als Kontext an Claude mitgegeben wird — das eigentliche "Gedächtnis".
     """
-    goals = fetch_entries(conn, user_id, "goal", limit=10)
     journal = fetch_entries(conn, user_id, "journal", limit=10)
-    tasks = fetch_entries(conn, user_id, "task", limit=20)
+    tasks = fetch_entries(conn, user_id, "task", limit=30)
+    vision = fetch_entries(conn, user_id, "vision", limit=1)
+    projects = fetch_entries(conn, user_id, "project", limit=10)
     chat = fetch_entries_by_types(conn, user_id, ["chat_user", "chat_assistant"], limit=20)
     chat = list(reversed(chat))
 
     parts = []
-    if goals:
-        parts.append("Bisherige Ziele:\n" + "\n".join(f"- {g['content']}" for g in goals))
+    if vision:
+        parts.append("Strategisches Ziel / Vision der Person:\n" + vision[0]["content"])
+    if projects:
+        parts.append(
+            "Aktuelle Projekte (Teil der Strategie):\n"
+            + "\n".join(f"- {p['content']}" for p in projects)
+        )
     if tasks:
         offen = [t for t in tasks if not t["done"]]
         erledigt = [t for t in tasks if t["done"]]
         parts.append(
-            f"Offene Aufgaben ({len(offen)}):\n" + "\n".join(f"- {t['content']}" for t in offen[:10])
+            f"Offene Aufgaben ({len(offen)}):\n" + "\n".join(f"- {t['content']}" for t in offen[:15])
         )
         if erledigt:
             parts.append(f"Kürzlich erledigt: {len(erledigt)} Aufgaben.")
     if journal:
-        parts.append("Journal-Einträge (neueste zuerst):\n" + "\n".join(f"- {j['content']}" for j in journal))
+        parts.append("Frühere Reflexions-Notizen:\n" + "\n".join(f"- {j['content']}" for j in journal))
 
     return "\n\n".join(parts) if parts else "Noch keine bisherige Historie vorhanden."
 
@@ -318,48 +338,61 @@ async def call_claude(system_prompt: str, user_message: str) -> str:
     return "\n".join(text_blocks) if text_blocks else "(keine Antwort erhalten)"
 
 
-MENTOR_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor, ein persönlicher Struktur-Begleiter für jemanden, \
-der gerade den Übergang von einer Festanstellung in die Selbständigkeit in der Schweiz durchläuft.
+MENTOR_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor: eine Kombination aus persönlichem Chief of Staff \
+und strategischem Sparring-Partner für jemanden, der gerade den Übergang von einer Festanstellung in \
+die Selbständigkeit in der Schweiz durchläuft. Diese Chat-Seite ist die zentrale Startseite der Person \
+— hier landet alles: spontane Gedanken (Braindump), zu erledigende Dinge, und strategische Fragen.
 
-Du kennst die bisherige Geschichte der Person (Ziele, Aufgaben, Journal-Einträge) — nutze das aktiv, \
-um wirklich persönlich zu antworten, nicht generisch. Beziehe dich konkret auf das, was die Person \
-bisher erwähnt hat, wenn es relevant ist.
+Du kennst die bisherige Geschichte der Person (strategisches Ziel/Vision, Projekte, offene Aufgaben, \
+frühere Reflexionen) — nutze das aktiv, um wirklich persönlich zu antworten, nicht generisch.
 
-Deine Rolle ist die eines strategischen Sparring-Partners, nicht die eines Befehlsgebers oder reinen \
-Aufgaben-Verwalters:
-- Du bist primär STRATEGISCH, nicht operativ. Die Frage "was steht heute an" beantwortet der \
-Aufgaben-Tracker bereits - deine Stärke ist "was ist eigentlich wichtig, und warum".
-- Wenn die Person Anzeichen zeigt, mehrere Dinge gleichzeitig anzufangen oder sich zu verzetteln \
-(z.B. viele verschiedene Ziele/Ideen in kurzer Zeit), sprich das direkt und freundlich an - hilf, \
-einen Fokus zu finden, statt einfach jede neue Idee unterstützend zu bestätigen.
+DEINE ZWEI FUNKTIONEN IN JEDER NACHRICHT:
+
+1. AUFGABEN ERKENNEN UND ORGANISIEREN: Wenn die Nachricht der Person konkrete To-dos, Pläne oder \
+Dinge enthält, die erledigt werden müssen (auch beiläufig erwähnt, als Liste, oder mitten in einem \
+längeren Text) - extrahiere diese als einzelne, klare Aufgaben. Für jede Aufgabe schätze grob ein, \
+wann sie fällig sein sollte: "heute", "morgen", "diese_woche", oder null (kein klarer Zeitrahmen, \
+kommt in die allgemeine Liste). Erfinde KEINE Aufgaben, die nicht wirklich in der Nachricht \
+angedeutet wurden. Reine Reflexion, Fragen oder ein Gespräch ohne konkrete To-dos: leeres \
+Aufgaben-Array, das ist normal und richtig so.
+
+2. STRATEGISCHES SPARRING: Das ist deine wichtigste Rolle, nicht nur Nebensache:
+- Du bist primär STRATEGISCH, nicht operativ. Die Frage "was steht heute an" beantwortet die \
+Aufgaben-Extraktion oben bereits - deine eigentliche Stärke ist "was ist eigentlich wichtig, und warum".
+- Wenn die Person Anzeichen zeigt, mehrere Dinge gleichzeitig anzufangen oder sich zu verzetteln, \
+sprich das direkt und freundlich an - hilf, einen Fokus zu finden, statt jede neue Idee unterstützend \
+zu bestätigen.
 - Wenn die Person sehr euphorisch über eine neue Idee klingt, darfst du diese Euphorie sanft erden, \
-mit einer ehrlichen, aber wohlwollenden Nachfrage - nicht bremsen um des Bremsens willen, sondern \
-um echte Reflexion statt reinem Enthusiasmus anzuregen.
+mit einer ehrlichen, wohlwollenden Nachfrage - nicht bremsen um des Bremsens willen, sondern um echte \
+Reflexion statt reinem Enthusiasmus anzuregen.
 - Schiess nicht vorschnell auf eine einzelne Idee oder Lösung ein, nur weil die Person sie gerade \
 erwähnt hat. Frag nach, biete Perspektiven, statt die erste Idee unhinterfragt zu bestärken.
-- Von aussen ist oft klar, wo der Fokus liegen sollte - von innen, mitten im Prozess, ist das \
-schwieriger. Genau dabei hilfst du: einen Aussenblick geben, ohne belehrend zu wirken.
+- Erinnere die Person bei Gelegenheit an ihr strategisches Ziel/ihre Vision (falls im Kontext \
+vorhanden), besonders wenn die aktuelle Nachricht davon abzuweichen scheint.
 
 Weitere Regeln:
 - Antworte warm, aber sachlich - keine übertriebene Cheerleader-Sprache.
 - Kurz und konkret, auf Deutsch.
 - Bei RAV/AHV/Steuerfragen: allgemeine Informationen ja, aber keine verbindliche Rechts- oder \
 Steuerberatung. Bei unklaren Einzelfällen auf RAV/Ausgleichskasse/Treuhänder verweisen.
-- Erfinde keine Fakten über die Person, die nicht im Kontext stehen."""
-
-
-GOAL_SYSTEM_PROMPT = """Du bist der "Sole."-Ziel-Agent. Die Person beschreibt ein Ziel für die Woche \
-oder den Monat. Zerlege es in genau 3 konkrete Prioritäten und pro Priorität 1-2 sofort umsetzbare \
-Aufgaben. Berücksichtige die bisherige Historie der Person, falls relevant (z.B. keine Aufgabe \
-vorschlagen, die laut Historie schon erledigt ist).
+- Erfinde keine Fakten über die Person, die nicht im Kontext stehen.
 
 Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
 {
-  "kategorie": "kurze Bezeichnung, z.B. 'Akquise-Ziel'",
-  "begruendung": "1 Satz, warum diese Einordnung",
-  "prioritaeten": ["Priorität 1", "Priorität 2", "Priorität 3"],
-  "aufgaben": ["Aufgabe 1", "Aufgabe 2", "Aufgabe 3", "Aufgabe 4"]
-}"""
+  "antwort": "deine eigentliche Chat-Antwort als Sparring-Partner, kann Markdown enthalten (**fett**, > Zitate)",
+  "neue_aufgaben": [
+    {"inhalt": "konkrete Aufgabe", "faellig": "heute"},
+    {"inhalt": "andere Aufgabe", "faellig": null}
+  ]
+}
+Falls keine Aufgaben erkennbar sind: "neue_aufgaben": []"""
+
+
+STRATEGY_SYSTEM_PROMPT = """Du hilfst dabei, die strategische Vision einer Person zu schärfen, die \
+sich selbständig macht. Die Person gibt einen groben, evtl. unstrukturierten Text zu ihrer Vision. \
+Formuliere daraus 2-4 klare, prägnante Sätze, die den Kern erfassen - nicht länger, nicht \
+ausschmückender als nötig. Antworte NUR mit dem geschärften Text, ohne Anführungszeichen, ohne \
+zusätzliche Erklärung."""
 
 
 # ---------------------------------------------------------------------------
@@ -424,8 +457,8 @@ def create_entry(entry: EntryIn, user: dict = Depends(get_current_user)):
     with get_db() as conn:
         new_id = run_write(
             conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, ?, ?, FALSE, ?)",
-            (user["user_id"], entry.type, entry.content, now_iso()),
+            "INSERT INTO entries (user_id, type, content, done, due_date, created_at) VALUES (?, ?, ?, FALSE, ?, ?)",
+            (user["user_id"], entry.type, entry.content, entry.due_date, now_iso()),
         )
         return {"id": new_id}
 
@@ -455,8 +488,22 @@ def delete_entry(entry_id: int, user: dict = Depends(get_current_user)):
         return {"ok": True}
 
 
+def due_date_from_label(label: Optional[str]) -> Optional[str]:
+    """Wandelt 'heute'/'morgen'/'diese_woche'/None in ein echtes ISO-Datum um."""
+    today = datetime.now(timezone.utc).date()
+    if label == "heute":
+        return today.isoformat()
+    if label == "morgen":
+        return (today + timedelta(days=1)).isoformat()
+    if label == "diese_woche":
+        return (today + timedelta(days=3)).isoformat()  # grobe Mitte der Woche
+    return None
+
+
 @app.post("/chat")
 async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
+    import json
+
     with get_db() as conn:
         memory = build_memory_context(conn, user["user_id"])
         run_write(
@@ -466,54 +513,88 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         )
 
     system_prompt = f"{MENTOR_SYSTEM_PROMPT}\n\n--- Bisherige Historie der Person ---\n{memory}"
-    answer = await call_claude(system_prompt, payload.message)
+    raw = await call_claude(system_prompt, payload.message)
+
+    try:
+        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(cleaned)
+        antwort = parsed.get("antwort", raw)
+        neue_aufgaben = parsed.get("neue_aufgaben", [])
+    except (json.JSONDecodeError, AttributeError):
+        # Falls das Parsen fehlschlägt, nutzen wir die Rohantwort ohne Aufgaben-Extraktion,
+        # damit der Chat trotzdem funktioniert, statt komplett zu scheitern.
+        antwort = raw
+        neue_aufgaben = []
 
     with get_db() as conn:
         run_write(
             conn,
             "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_assistant', ?, FALSE, ?)",
-            (user["user_id"], answer, now_iso()),
+            (user["user_id"], antwort, now_iso()),
         )
+        erstellte_aufgaben = []
+        for aufgabe in neue_aufgaben:
+            inhalt = aufgabe.get("inhalt", "") if isinstance(aufgabe, dict) else str(aufgabe)
+            faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
+            if not inhalt:
+                continue
+            due = due_date_from_label(faellig_label)
+            run_write(
+                conn,
+                "INSERT INTO entries (user_id, type, content, done, due_date, created_at) VALUES (?, 'task', ?, FALSE, ?, ?)",
+                (user["user_id"], inhalt, due, now_iso()),
+            )
+            erstellte_aufgaben.append(inhalt)
 
-    return {"answer": answer}
+    return {"answer": antwort, "neue_aufgaben": erstellte_aufgaben}
 
 
-@app.post("/goal/decompose")
-async def decompose_goal(payload: GoalIn, user: dict = Depends(get_current_user)):
-    import json
+# ---------------------------------------------------------------------------
+# Strategy-Endpoints — Vision + Projekte, der "Kompass"
+# ---------------------------------------------------------------------------
 
+@app.get("/strategy")
+def get_strategy(user: dict = Depends(get_current_user)):
     with get_db() as conn:
-        memory = build_memory_context(conn, user["user_id"])
+        vision = fetch_entries(conn, user["user_id"], "vision", limit=1)
+        projects = fetch_entries(conn, user["user_id"], "project", limit=20)
+    return {
+        "vision": vision[0]["content"] if vision else "",
+        "projects": projects,
+    }
+
+
+@app.post("/strategy/vision")
+async def set_vision(payload: GoalIn, user: dict = Depends(get_current_user)):
+    """Nimmt einen groben Vision-Text entgegen, lässt ihn von Claude schärfen, speichert ihn."""
+    refined = await call_claude(STRATEGY_SYSTEM_PROMPT, payload.goal)
+    with get_db() as conn:
         run_write(
             conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'goal', ?, FALSE, ?)",
-            (user["user_id"], payload.goal, now_iso()),
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'vision', ?, FALSE, ?)",
+            (user["user_id"], refined, now_iso()),
         )
+    return {"vision": refined}
 
-    system_prompt = f"{GOAL_SYSTEM_PROMPT}\n\n--- Bisherige Historie der Person ---\n{memory}"
-    raw = await call_claude(system_prompt, payload.goal)
 
-    try:
-        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        parsed = json.loads(cleaned)
-    except (json.JSONDecodeError, AttributeError):
-        raise HTTPException(status_code=502, detail=f"Konnte Antwort nicht parsen: {raw}")
-
+@app.post("/strategy/project")
+def add_project(entry: EntryIn, user: dict = Depends(get_current_user)):
     with get_db() as conn:
-        for p in parsed.get("prioritaeten", []):
-            run_write(
-                conn,
-                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'priority', ?, FALSE, ?)",
-                (user["user_id"], p, now_iso()),
-            )
-        for t in parsed.get("aufgaben", []):
-            run_write(
-                conn,
-                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'task', ?, FALSE, ?)",
-                (user["user_id"], t, now_iso()),
-            )
+        new_id = run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'project', ?, FALSE, ?)",
+            (user["user_id"], entry.content, now_iso()),
+        )
+    return {"id": new_id}
 
-    return parsed
+
+@app.delete("/strategy/project/{project_id}")
+def delete_project(project_id: int, user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        run_write(
+            conn, "DELETE FROM entries WHERE id = ? AND user_id = ?", (project_id, user["user_id"])
+        )
+    return {"ok": True}
 
 
 @app.get("/health")
