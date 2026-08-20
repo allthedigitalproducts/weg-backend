@@ -286,8 +286,6 @@ def build_memory_context(conn, user_id: int) -> str:
     tasks = fetch_entries(conn, user_id, "task", limit=30)
     overall_vision = fetch_entries(conn, user_id, "overall_vision", limit=1)
     ventures_raw = fetch_entries(conn, user_id, "venture", limit=20)
-    chat = fetch_entries_by_types(conn, user_id, ["chat_user", "chat_assistant"], limit=20)
-    chat = list(reversed(chat))
 
     parts = []
     if profile:
@@ -332,7 +330,13 @@ def build_memory_context(conn, user_id: int) -> str:
     return "\n\n".join(parts) if parts else "Noch keine bisherige Historie vorhanden."
 
 
-async def call_claude(system_prompt: str, user_message: str) -> str:
+async def call_claude(system_prompt: str, messages: list[dict]) -> str:
+    """
+    messages: Liste von {"role": "user"|"assistant", "content": "..."} — die komplette
+    bisherige Unterhaltung inkl. der neuesten Nachricht. Das ist wichtig, damit Claude
+    sich innerhalb EINES Gesprächs an bereits Gesagtes erinnert (z.B. beim Onboarding-
+    Gespräch, wo mehrere Fragen nacheinander gestellt werden).
+    """
     if not ANTHROPIC_API_KEY:
         raise HTTPException(
             status_code=500,
@@ -351,7 +355,7 @@ async def call_claude(system_prompt: str, user_message: str) -> str:
                 "model": ANTHROPIC_MODEL,
                 "max_tokens": 1000,
                 "system": system_prompt,
-                "messages": [{"role": "user", "content": user_message}],
+                "messages": messages,
             },
         )
 
@@ -565,6 +569,19 @@ def delete_entry(entry_id: int, user: dict = Depends(get_current_user)):
         return {"ok": True}
 
 
+@app.delete("/chat/history")
+def clear_chat_history(user: dict = Depends(get_current_user)):
+    """Löscht den kompletten Chat-Verlauf (chat_user + chat_assistant) einer Person.
+    Lässt Profil, Aufgaben, Strategy-Daten unangetastet — betrifft nur die Unterhaltung selbst."""
+    with get_db() as conn:
+        run_write(
+            conn,
+            "DELETE FROM entries WHERE user_id = ? AND type IN ('chat_user', 'chat_assistant')",
+            (user["user_id"],),
+        )
+    return {"ok": True}
+
+
 def due_date_from_label(label: Optional[str]) -> Optional[str]:
     """Wandelt 'heute'/'morgen'/'diese_woche'/None in ein echtes ISO-Datum um."""
     today = datetime.now(timezone.utc).date()
@@ -584,15 +601,30 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     with get_db() as conn:
         memory = build_memory_context(conn, user["user_id"])
         has_profile = bool(fetch_entries(conn, user["user_id"], "profile", limit=1))
+
+        # Bisherige Unterhaltung ALS ECHTE NACHRICHTEN abrufen, bevor wir die neue
+        # Nachricht einfügen — das ist entscheidend, damit Claude sich innerhalb
+        # des Gesprächs an bereits gestellte Fragen/Antworten erinnert.
+        previous_turns = fetch_entries_by_types(
+            conn, user["user_id"], ["chat_user", "chat_assistant"], limit=30
+        )
+        previous_turns = list(reversed(previous_turns))  # chronologisch aufsteigend
+
         run_write(
             conn,
             "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_user', ?, FALSE, ?)",
             (user["user_id"], payload.message, now_iso()),
         )
 
+    messages = [
+        {"role": "user" if t["type"] == "chat_user" else "assistant", "content": t["content"]}
+        for t in previous_turns
+    ]
+    messages.append({"role": "user", "content": payload.message})
+
     base_prompt = ONBOARDING_SYSTEM_PROMPT if (not has_profile or payload.mode == "onboarding") else MENTOR_SYSTEM_PROMPT
-    system_prompt = f"{base_prompt}\n\n--- Bisherige Historie der Person ---\n{memory}"
-    raw = await call_claude(system_prompt, payload.message)
+    system_prompt = f"{base_prompt}\n\n--- Bekannte Eckdaten der Person (Profil, Vision, Aufgaben) ---\n{memory}"
+    raw = await call_claude(system_prompt, messages)
 
     try:
         cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -736,7 +768,9 @@ async def set_overall_vision(payload: GoalIn, user: dict = Depends(get_current_u
     if venture_names:
         context = "\n\n(Bekannte Standbeine der Person: " + ", ".join(venture_names) + ")"
 
-    refined = await call_claude(STRATEGY_SYSTEM_PROMPT, payload.goal + context)
+    refined = await call_claude(
+        STRATEGY_SYSTEM_PROMPT, [{"role": "user", "content": payload.goal + context}]
+    )
     with get_db() as conn:
         run_write(
             conn,
