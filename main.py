@@ -47,6 +47,10 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_DAYS = 30
 
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
 app = FastAPI(title="Sole. Backend")
 
 app.add_middleware(
@@ -82,9 +86,11 @@ if USE_POSTGRES:
                     id SERIAL PRIMARY KEY,
                     email TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
+                    approved BOOLEAN DEFAULT FALSE,
                     created_at TEXT NOT NULL
                 )
             """)
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT FALSE")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS entries (
                     id SERIAL PRIMARY KEY,
@@ -141,9 +147,14 @@ else:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     email TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
+                    approved INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL
                 )
             """)
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN approved INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # Spalte existiert schon
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -372,6 +383,32 @@ async def call_claude(system_prompt: str, messages: list[dict]) -> str:
     return "\n".join(text_blocks) if text_blocks else "(keine Antwort erhalten)"
 
 
+async def send_email(to: str, subject: str, html_body: str) -> bool:
+    """Verschickt eine E-Mail über Resend. Gibt True/False zurück statt einen Fehler
+    zu werfen, damit ein einzelner Versand-Fehler nicht den ganzen Wochen-Rückblick
+    für alle anderen Personen abbricht."""
+    if not RESEND_API_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": RESEND_FROM_EMAIL,
+                    "to": [to],
+                    "subject": subject,
+                    "html": html_body,
+                },
+            )
+        return response.status_code < 300
+    except Exception:
+        return False
+
+
 MENTOR_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor: eine Kombination aus persönlichem Chief of Staff \
 und strategischem Sparring-Partner für jemanden, der gerade den Übergang von einer Festanstellung in \
 die Selbständigkeit in der Schweiz durchläuft. Diese Chat-Seite ist die zentrale Startseite der Person \
@@ -502,12 +539,23 @@ def signup(payload: SignupIn):
         if existing:
             raise HTTPException(status_code=409, detail="Diese E-Mail ist bereits registriert.")
 
+        # Das allererste Konto überhaupt (die Betreiberin) wird automatisch freigeschaltet.
+        # Alle danach brauchen eine manuelle Freigabe (z.B. direkt in Supabase).
+        any_users = run_query(conn, "SELECT id FROM users LIMIT 1")
+        auto_approve = len(any_users) == 0
+
         password_hash = hash_password(payload.password)
         user_id = run_write(
             conn,
-            "INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
-            (email, password_hash, now_iso()),
+            "INSERT INTO users (email, password_hash, approved, created_at) VALUES (?, ?, ?, ?)",
+            (email, password_hash, auto_approve, now_iso()),
         )
+
+    if not auto_approve:
+        return {
+            "pending_approval": True,
+            "message": "Konto erstellt — wartet noch auf Freischaltung durch die Betreiberin. Du wirst benachrichtigt, sobald es losgehen kann.",
+        }
 
     token = create_token(user_id, email)
     return {"token": token, "email": email}
@@ -523,6 +571,12 @@ def login(payload: LoginIn):
         raise HTTPException(status_code=401, detail="E-Mail oder Passwort falsch.")
 
     user = rows[0]
+    if not user["approved"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Dein Konto wartet noch auf Freischaltung durch die Betreiberin.",
+        )
+
     token = create_token(user["id"], user["email"])
     return {"token": token, "email": user["email"]}
 
@@ -725,9 +779,57 @@ def set_profile(payload: ProfileIn, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
+@app.get("/profile/journey")
+def get_journey(user: dict = Depends(get_current_user)):
+    """Stellt Statistiken für die 'Deine Reise'-Übersicht zusammen: seit wann dabei,
+    wie viel erledigt, plus die Entwicklung des Profils über Zeit."""
+    import json
+
+    with get_db() as conn:
+        member_since_rows = run_query(
+            conn, "SELECT created_at FROM users WHERE id = ?", (user["user_id"],)
+        )
+        tasks = fetch_entries(conn, user["user_id"], "task", limit=1000)
+        ventures_raw = fetch_entries(conn, user["user_id"], "venture", limit=100)
+        profile_history = fetch_entries(conn, user["user_id"], "profile", limit=20)
+
+    aufgaben_erledigt = len([t for t in tasks if t["done"]])
+    standbeine = len(ventures_raw)
+
+    meilensteine_erreicht = 0
+    for v in ventures_raw:
+        try:
+            data = json.loads(v["content"])
+            for m in normalize_meilensteine(data.get("meilensteine")):
+                if isinstance(m, dict) and m.get("erledigt"):
+                    meilensteine_erreicht += 1
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    historie = []
+    for p in profile_history:
+        try:
+            data = json.loads(p["content"])
+            historie.append({
+                "datum": p["created_at"][:10],
+                "situation": data.get("situation", ""),
+            })
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return {
+        "seit": member_since_rows[0]["created_at"][:10] if member_since_rows else None,
+        "aufgaben_erledigt": aufgaben_erledigt,
+        "standbeine": standbeine,
+        "meilensteine_erreicht": meilensteine_erreicht,
+        "profil_historie": list(reversed(historie)),  # älteste zuerst
+    }
+
+
 class MeilensteinIn(BaseModel):
     text: str
     datum: Optional[str] = None  # ISO-Datum YYYY-MM-DD, optional
+    erledigt: bool = False
 
 
 class VentureIn(BaseModel):
@@ -742,8 +844,11 @@ def normalize_meilensteine(raw) -> list:
     if isinstance(raw, str):
         if not raw.strip():
             return []
-        return [{"text": raw, "datum": None}]
+        return [{"text": raw, "datum": None, "erledigt": False}]
     if isinstance(raw, list):
+        for m in raw:
+            if isinstance(m, dict) and "erledigt" not in m:
+                m["erledigt"] = False
         return raw
     return []
 
@@ -817,6 +922,20 @@ def add_venture(payload: VentureIn, user: dict = Depends(get_current_user)):
     return {"id": new_id}
 
 
+@app.put("/strategy/venture/{venture_id}")
+def update_venture(venture_id: int, payload: VentureIn, user: dict = Depends(get_current_user)):
+    import json
+
+    content = json.dumps(payload.model_dump(), ensure_ascii=False)
+    with get_db() as conn:
+        run_write(
+            conn,
+            "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
+            (content, venture_id, user["user_id"]),
+        )
+    return {"ok": True}
+
+
 @app.delete("/strategy/venture/{venture_id}")
 def delete_venture(venture_id: int, user: dict = Depends(get_current_user)):
     with get_db() as conn:
@@ -824,6 +943,88 @@ def delete_venture(venture_id: int, user: dict = Depends(get_current_user)):
             conn, "DELETE FROM entries WHERE id = ? AND user_id = ?", (venture_id, user["user_id"])
         )
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Wöchentlicher E-Mail-Rückblick — wird NICHT von Personen direkt aufgerufen,
+# sondern einmal pro Woche von einem zeitgesteuerten Auslöser (Cron Job).
+# Geschützt durch ein Secret, damit nicht irgendjemand diesen Endpoint missbraucht.
+# ---------------------------------------------------------------------------
+
+DIGEST_SYSTEM_PROMPT = """Du schreibst einen kurzen, warmen wöchentlichen Rückblick-Absatz (3-4 Sätze) \
+für eine Person im Übergang in die Selbständigkeit, als Teil einer E-Mail. Beziehe dich auf ihre \
+erledigten Aufgaben diese Woche, ihre Vision/Situation falls bekannt, und ermutige sie ehrlich, ohne \
+übertriebene Cheerleader-Sprache. Auf Deutsch. Antworte NUR mit dem Absatz-Text, kein JSON, keine \
+Anführungszeichen, keine Überschrift."""
+
+
+@app.post("/admin/send-weekly-digests")
+async def send_weekly_digests(x_cron_secret: str = Header(None)):
+    import json
+
+    if not CRON_SECRET or x_cron_secret != CRON_SECRET:
+        raise HTTPException(status_code=401, detail="Ungültiges oder fehlendes Cron-Secret.")
+
+    with get_db() as conn:
+        users = run_query(conn, "SELECT id, email FROM users")
+
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    sent_count = 0
+
+    for u in users:
+        with get_db() as conn:
+            tasks = fetch_entries(conn, u["id"], "task", limit=200)
+            profile = fetch_entries(conn, u["id"], "profile", limit=1)
+
+        erledigt_diese_woche = [
+            t for t in tasks if t["done"] and t["created_at"] >= week_ago
+        ]
+        offen = [t for t in tasks if not t["done"]]
+
+        name = ""
+        situation = ""
+        if profile:
+            try:
+                p = json.loads(profile[0]["content"])
+                name = p.get("name", "")
+                situation = p.get("situation", "")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        summary_input = (
+            f"Name: {name or 'unbekannt'}\nSituation: {situation or 'unbekannt'}\n"
+            f"Diese Woche erledigt ({len(erledigt_diese_woche)}): "
+            + ", ".join(t["content"] for t in erledigt_diese_woche[:8])
+            + f"\nOffene Aufgaben aktuell: {len(offen)}"
+        )
+
+        try:
+            absatz = await call_claude(
+                DIGEST_SYSTEM_PROMPT, [{"role": "user", "content": summary_input}]
+            )
+        except HTTPException:
+            absatz = "Schön, dass du diese Woche dabei warst."
+
+        html = f"""
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px;">
+          <h2 style="font-family:serif;">Sole. — Dein Wochenrückblick</h2>
+          <p>{absatz}</p>
+          <p style="font-size:13px;color:#666;">
+            {len(erledigt_diese_woche)} Aufgabe(n) erledigt diese Woche, {len(offen)} noch offen.
+          </p>
+          <a href="https://charming-moxie-8f36aa.netlify.app/sole-mentor.html"
+             style="display:inline-block;background:#1C2E29;color:#fff;padding:10px 20px;
+                    border-radius:999px;text-decoration:none;margin-top:12px;">
+            Zu Sole. →
+          </a>
+        </div>
+        """
+
+        success = await send_email(u["email"], "Dein Sole.-Wochenrückblick", html)
+        if success:
+            sent_count += 1
+
+    return {"ok": True, "sent": sent_count, "total_users": len(users)}
 
 
 @app.get("/health")
