@@ -199,6 +199,8 @@ class EntryIn(BaseModel):
 class EntryUpdate(BaseModel):
     done: Optional[bool] = None
     content: Optional[str] = None
+    due_date: Optional[str] = None
+    clear_due_date: bool = False  # explizit auf "kein Datum" zurücksetzen
 
 
 class ChatIn(BaseModel):
@@ -447,6 +449,10 @@ Weitere Regeln:
 - Bei RAV/AHV/Steuerfragen: allgemeine Informationen ja, aber keine verbindliche Rechts- oder \
 Steuerberatung. Bei unklaren Einzelfällen auf RAV/Ausgleichskasse/Treuhänder verweisen.
 - Erfinde keine Fakten über die Person, die nicht im Kontext stehen.
+- Erfinde NIEMALS technische Erklärungen oder Ausreden über deine eigenen Fähigkeiten oder \
+angebliche "Bugs" - du weisst nicht, wie das System im Hintergrund funktioniert. Falls du etwas \
+nicht direkt kannst (z.B. das Datum einer bereits bestehenden Aufgabe nachträglich ändern), sag \
+das ehrlich und verweise auf die Aufgaben-Seite in der App, wo es direkt möglich ist.
 - Falls im Kontext ein Profil der Person vorhanden ist (Name, Situation, Vision, Sorge, \
 gewünschter Kommunikationsstil): nutze den Namen zur Anrede, passe deinen Ton an den \
 gewünschten Stil an, und beziehe dich bei Gelegenheit auf die genannte Sorge/Vision.
@@ -617,6 +623,18 @@ def update_entry(entry_id: int, update: EntryUpdate, user: dict = Depends(get_cu
                 conn,
                 "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
                 (update.content, entry_id, user["user_id"]),
+            )
+        if update.clear_due_date:
+            run_write(
+                conn,
+                "UPDATE entries SET due_date = NULL WHERE id = ? AND user_id = ?",
+                (entry_id, user["user_id"]),
+            )
+        elif update.due_date is not None:
+            run_write(
+                conn,
+                "UPDATE entries SET due_date = ? WHERE id = ? AND user_id = ?",
+                (update.due_date, entry_id, user["user_id"]),
             )
         return {"ok": True}
 
