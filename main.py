@@ -24,6 +24,7 @@ Siehe README.md für Details zum Supabase-Setup.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -339,7 +340,9 @@ def build_memory_context(conn, user_id: int) -> str:
                 meilensteine = normalize_meilensteine(data.get("meilensteine"))
                 if meilensteine:
                     m_text = "; ".join(
-                        f"{m.get('text','')}" + (f" ({m['datum']})" if m.get("datum") else "")
+                        f"{m.get('text','')}"
+                        + (f" ({m['datum']})" if m.get("datum") else "")
+                        + (f" [Messgrösse: {m['messgroesse']}]" if m.get("messgroesse") else "")
                         for m in meilensteine
                     )
                     line += f" (Meilensteine: {m_text})"
@@ -437,11 +440,14 @@ DEINE DREI FUNKTIONEN IN JEDER NACHRICHT:
 
 1. AUFGABEN ERKENNEN UND ORGANISIEREN: Wenn die Nachricht der Person konkrete To-dos, Pläne oder \
 Dinge enthält, die erledigt werden müssen (auch beiläufig erwähnt, als Liste, oder mitten in einem \
-längeren Text) - extrahiere diese als einzelne, klare Aufgaben. Für jede Aufgabe schätze grob ein, \
-wann sie fällig sein sollte: "heute", "morgen", "diese_woche", oder null (kein klarer Zeitrahmen, \
-kommt in die allgemeine Liste). Erfinde KEINE Aufgaben, die nicht wirklich in der Nachricht \
-angedeutet wurden. Reine Reflexion, Fragen oder ein Gespräch ohne konkrete To-dos: leeres \
-Aufgaben-Array, das ist normal und richtig so.
+längeren Text) - extrahiere diese als einzelne, klare Aufgaben. Für jede Aufgabe gib "faellig" an: \
+"heute", "morgen", "diese_woche", EIN KONKRETES DATUM im Format "YYYY-MM-DD" (wenn du einen \
+bestimmten Tag kennst, z.B. bei einem Wochenplan mit mehreren verschiedenen Tagen - rechne das \
+Datum anhand des heutigen Datums oben selbst aus), oder null (kein klarer Zeitrahmen, kommt in die \
+allgemeine Liste). Nutze IMMER ein konkretes Datum statt "diese_woche", sobald du weisst, an \
+welchem Wochentag etwas stattfinden soll - "diese_woche" ist nur für vage Fälle ohne bekannten Tag. \
+Erfinde KEINE Aufgaben, die nicht wirklich in der Nachricht angedeutet wurden. Reine Reflexion, \
+Fragen oder ein Gespräch ohne konkrete To-dos: leeres Aufgaben-Array, das ist normal und richtig so.
 
 2. STRATEGISCHES SPARRING: Das ist deine wichtigste Rolle, nicht nur Nebensache:
 - Du bist primär STRATEGISCH, nicht operativ. Die Frage "was steht heute an" beantwortet die \
@@ -465,6 +471,15 @@ ein Arbeitsstil, eine Erkenntnis über ihre Motivation) - schreib einen kurzen A
 dazu in "notiz_update". Das ist NICHT für alltägliche Dinge (nicht "hat heute X erledigt") - nur \
 für echte, längerfristig relevante Einsichten. Bei den meisten Nachrichten bleibt "notiz_update" \
 leer/null - das ist der Normalfall, nicht die Ausnahme.
+
+4. STANDBEINE UND MEILENSTEINE ERKENNEN: Wenn im Gespräch über ein konkretes Geschäftsfeld/Projekt \
+gesprochen wird (z.B. ein Name dafür vergeben wird, eine Vision/Zahlen/Ziele genannt werden, oder \
+konkrete Meilensteine besprochen werden) - trag das in "standbein_update" ein, damit es auf der \
+Strategy-Seite sichtbar wird, statt nur im Chat-Verlauf zu verschwinden. Nutze den Namen, den die \
+Person selbst für das Projekt gewählt hat (falls noch keiner genannt wurde, warte damit, statt \
+selbst einen zu erfinden). Ergänze nur, was WIRKLICH in diesem Gespräch besprochen wurde - keine \
+Meilensteine erfinden. Bei den meisten Nachrichten bleibt "standbein_update" leer/null - nur \
+eintragen, wenn wirklich neue, strategisch relevante Standbein-Information genannt wurde.
 
 Weitere Regeln:
 - Antworte warm, aber sachlich - keine übertriebene Cheerleader-Sprache.
@@ -490,9 +505,21 @@ Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
   "antwort": "deine eigentliche Chat-Antwort als Sparring-Partner, kann Markdown enthalten (**fett**, > Zitate)",
   "neue_aufgaben": [
     {"inhalt": "konkrete Aufgabe", "faellig": "heute"},
+    {"inhalt": "Aufgabe für einen bestimmten Tag", "faellig": "2026-08-25"},
     {"inhalt": "andere Aufgabe", "faellig": null}
   ],
-  "notiz_update": null
+  "notiz_update": null,
+  "standbein_update": null
+}
+Falls ein Standbein wirklich besprochen wurde, statt null:
+{
+  "standbein_update": {
+    "name": "Name des Standbeins, wie die Person es selbst nennt",
+    "vision": "kurze Vision/Zahlen/Ziele, so wie besprochen",
+    "meilensteine": [
+      {"text": "konkreter Meilenstein", "datum": "2026-08-25 oder null", "messgroesse": "optional"}
+    ]
+  }
 }
 Falls keine Aufgaben erkennbar sind: "neue_aufgaben": []"""
 
@@ -725,14 +752,29 @@ def save_profile_merged(conn, user_id: int, updates: dict) -> dict:
 
 
 def due_date_from_label(label: Optional[str]) -> Optional[str]:
-    """Wandelt 'heute'/'morgen'/'diese_woche'/None in ein echtes ISO-Datum um."""
+    """Wandelt 'heute'/'morgen'/'diese_woche'/ein echtes ISO-Datum/None in ein
+    verwendbares ISO-Datum um. Sole kann jetzt auch direkt ein konkretes Datum
+    angeben (z.B. für einen Wochenplan mit mehreren verschiedenen Tagen)."""
+    if not label:
+        return None
+
     today = datetime.now(timezone.utc).date()
+
     if label == "heute":
         return today.isoformat()
     if label == "morgen":
         return (today + timedelta(days=1)).isoformat()
     if label == "diese_woche":
         return (today + timedelta(days=3)).isoformat()  # grobe Mitte der Woche
+
+    # Direktes ISO-Datum (YYYY-MM-DD), z.B. für einen Wochenplan mit mehreren Tagen
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", label):
+        try:
+            datetime.strptime(label, "%Y-%m-%d")  # validiert, dass es ein echtes Datum ist
+            return label
+        except ValueError:
+            return None
+
     return None
 
 
@@ -765,7 +807,10 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     messages.append({"role": "user", "content": payload.message})
 
     base_prompt = ONBOARDING_SYSTEM_PROMPT if (not has_profile or payload.mode == "onboarding") else MENTOR_SYSTEM_PROMPT
-    system_prompt = f"{base_prompt}\n\n--- Bekannte Eckdaten der Person (Profil, Vision, Aufgaben) ---\n{memory}"
+    heute = datetime.now(timezone.utc).date()
+    wochentage = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+    heute_text = f"Heutiges Datum: {heute.isoformat()} ({wochentage[heute.weekday()]})"
+    system_prompt = f"{base_prompt}\n\n{heute_text}\n\n--- Bekannte Eckdaten der Person (Profil, Vision, Aufgaben) ---\n{memory}"
     raw = await call_claude(system_prompt, messages)
 
     try:
@@ -775,6 +820,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         neue_aufgaben = parsed.get("neue_aufgaben", [])
         neues_profil = parsed.get("profil")
         notiz_update = parsed.get("notiz_update")
+        standbein_update = parsed.get("standbein_update")
     except (json.JSONDecodeError, AttributeError):
         # Falls das Parsen fehlschlägt, nutzen wir die Rohantwort ohne Extraktion,
         # damit der Chat trotzdem funktioniert, statt komplett zu scheitern.
@@ -782,6 +828,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         neue_aufgaben = []
         neues_profil = None
         notiz_update = None
+        standbein_update = None
 
     with get_db() as conn:
         run_write(
@@ -815,11 +862,72 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 (user["user_id"], notiz_update.strip(), now_iso()),
             )
 
+        standbein_gespeichert = False
+        if isinstance(standbein_update, dict) and standbein_update.get("name"):
+            neuer_name = standbein_update["name"].strip().lower()
+            bestehende_ventures = fetch_entries(conn, user["user_id"], "venture", limit=50)
+            passendes_venture = None
+            for v in bestehende_ventures:
+                try:
+                    v_data = json.loads(v["content"])
+                    if v_data.get("name", "").strip().lower() == neuer_name:
+                        passendes_venture = (v["id"], v_data)
+                        break
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+            neue_meilensteine = standbein_update.get("meilensteine", []) or []
+
+            if passendes_venture:
+                # Bestehendes Standbein: Vision aktualisieren (falls neu genannt),
+                # neue Meilensteine ergänzen, bestehende NICHT verlieren.
+                venture_id, v_data = passendes_venture
+                if standbein_update.get("vision"):
+                    v_data["vision"] = standbein_update["vision"]
+                bestehende_meilensteine = normalize_meilensteine(v_data.get("meilensteine"))
+                bestehende_texte = {m.get("text", "").strip().lower() for m in bestehende_meilensteine}
+                for m in neue_meilensteine:
+                    if isinstance(m, dict) and m.get("text", "").strip().lower() not in bestehende_texte:
+                        bestehende_meilensteine.append({
+                            "text": m.get("text", ""),
+                            "datum": m.get("datum"),
+                            "erledigt": False,
+                            "messgroesse": m.get("messgroesse", ""),
+                        })
+                v_data["meilensteine"] = bestehende_meilensteine
+                run_write(
+                    conn,
+                    "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
+                    (json.dumps(v_data, ensure_ascii=False), venture_id, user["user_id"]),
+                )
+            else:
+                # Neues Standbein anlegen
+                neues_venture = {
+                    "name": standbein_update["name"],
+                    "vision": standbein_update.get("vision", ""),
+                    "meilensteine": [
+                        {
+                            "text": m.get("text", ""),
+                            "datum": m.get("datum"),
+                            "erledigt": False,
+                            "messgroesse": m.get("messgroesse", ""),
+                        }
+                        for m in neue_meilensteine if isinstance(m, dict)
+                    ],
+                }
+                run_write(
+                    conn,
+                    "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'venture', ?, FALSE, ?)",
+                    (user["user_id"], json.dumps(neues_venture, ensure_ascii=False), now_iso()),
+                )
+            standbein_gespeichert = True
+
     return {
         "answer": antwort,
         "neue_aufgaben": erstellte_aufgaben,
         "onboarding": (not has_profile) or (payload.mode == "onboarding"),
         "profil_gespeichert": profil_gespeichert,
+        "standbein_gespeichert": standbein_gespeichert,
     }
 
 
@@ -970,6 +1078,7 @@ class MeilensteinIn(BaseModel):
     text: str
     datum: Optional[str] = None  # ISO-Datum YYYY-MM-DD, optional
     erledigt: bool = False
+    messgroesse: str = ""  # "Wie misst du, ob's erreicht ist?" — optional
 
 
 class VentureIn(BaseModel):
@@ -984,11 +1093,14 @@ def normalize_meilensteine(raw) -> list:
     if isinstance(raw, str):
         if not raw.strip():
             return []
-        return [{"text": raw, "datum": None, "erledigt": False}]
+        return [{"text": raw, "datum": None, "erledigt": False, "messgroesse": ""}]
     if isinstance(raw, list):
         for m in raw:
-            if isinstance(m, dict) and "erledigt" not in m:
-                m["erledigt"] = False
+            if isinstance(m, dict):
+                if "erledigt" not in m:
+                    m["erledigt"] = False
+                if "messgroesse" not in m:
+                    m["messgroesse"] = ""
         return raw
     return []
 
