@@ -309,8 +309,13 @@ def build_memory_context(conn, user_id: int) -> str:
             try:
                 data = json.loads(v["content"])
                 line = f"- {data.get('name', 'unbenannt')}: {data.get('vision', '')}"
-                if data.get("meilensteine"):
-                    line += f" (Meilensteine: {data['meilensteine']})"
+                meilensteine = normalize_meilensteine(data.get("meilensteine"))
+                if meilensteine:
+                    m_text = "; ".join(
+                        f"{m.get('text','')}" + (f" ({m['datum']})" if m.get("datum") else "")
+                        for m in meilensteine
+                    )
+                    line += f" (Meilensteine: {m_text})"
                 venture_lines.append(line)
             except (json.JSONDecodeError, TypeError):
                 continue
@@ -720,10 +725,27 @@ def set_profile(payload: ProfileIn, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
+class MeilensteinIn(BaseModel):
+    text: str
+    datum: Optional[str] = None  # ISO-Datum YYYY-MM-DD, optional
+
+
 class VentureIn(BaseModel):
     name: str
     vision: str = ""
-    meilensteine: str = ""
+    meilensteine: list[MeilensteinIn] = []
+
+
+def normalize_meilensteine(raw) -> list:
+    """Alte Ventures hatten 'meilensteine' als einen einzigen Textblock ohne Datum.
+    Wandelt das für die Anzeige in die neue Listenform um, ohne Daten zu verlieren."""
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        return [{"text": raw, "datum": None}]
+    if isinstance(raw, list):
+        return raw
+    return []
 
 
 @app.get("/strategy")
@@ -739,6 +761,7 @@ def get_strategy(user: dict = Depends(get_current_user)):
         try:
             data = json.loads(v["content"])
             data["id"] = v["id"]
+            data["meilensteine"] = normalize_meilensteine(data.get("meilensteine"))
             ventures.append(data)
         except (json.JSONDecodeError, TypeError):
             continue
