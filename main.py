@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -88,10 +89,12 @@ if USE_POSTGRES:
                     email TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
                     approved BOOLEAN DEFAULT FALSE,
+                    calendar_token TEXT,
                     created_at TEXT NOT NULL
                 )
             """)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_token TEXT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS entries (
                     id SERIAL PRIMARY KEY,
@@ -149,13 +152,15 @@ else:
                     email TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
                     approved INTEGER DEFAULT 0,
+                    calendar_token TEXT,
                     created_at TEXT NOT NULL
                 )
             """)
-            try:
-                conn.execute("ALTER TABLE users ADD COLUMN approved INTEGER DEFAULT 0")
-            except sqlite3.OperationalError:
-                pass  # Spalte existiert schon
+            for col_def in ["approved INTEGER DEFAULT 0", "calendar_token TEXT"]:
+                try:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {col_def}")
+                except sqlite3.OperationalError:
+                    pass  # Spalte existiert schon
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -346,6 +351,10 @@ def build_memory_context(conn, user_id: int) -> str:
                         for m in meilensteine
                     )
                     line += f" (Meilensteine: {m_text})"
+                umsatz = normalize_umsatz(data.get("umsatz"))
+                if umsatz:
+                    gesamt = sum(u.get("betrag", 0) for u in umsatz)
+                    line += f" [Bisheriger Umsatz: CHF {gesamt:,.0f} über {len(umsatz)} Einträge]"
                 venture_lines.append(line)
             except (json.JSONDecodeError, TypeError):
                 continue
@@ -581,6 +590,34 @@ Erst nach expliziter Bestätigung durch die Person, im selben Format aber mit au
 }"""
 
 
+CHECKIN_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Das ist eine bewusste STANDORTBESTIMMUNG mit \
+einer Person, die du bereits kennst - NICHT das erste Gespräch. Du hast Zugriff auf ihr bisheriges \
+Profil, ihre Aufgaben, ihren Compass (Standbeine/Vision) und frühere Notizen (siehe Kontext unten).
+
+WICHTIG: Frag NICHT nach Dingen, die du laut Kontext bereits weisst - nicht nochmal "wie darf ich \
+dich nennen" oder Ähnliches. Das hier ist ein kurzes Check-in, kein neues Onboarding.
+
+Stell 2-4 fokussierte Fragen (eine nach der anderen, nicht alle auf einmal), um herauszufinden, \
+was sich seit dem letzten Austausch verändert hat - zum Beispiel: ist die Situation noch aktuell, \
+ist die bisherige Sorge noch relevant oder hat sich was Neues ergeben, hat sich an der Vision oder \
+den Prioritäten etwas verschoben. Halte es kurz und zielgerichtet.
+
+Sobald du genug erfahren hast: fasse kurz zusammen, was sich geändert hat (falls überhaupt etwas), \
+und aktualisiere NUR die tatsächlich betroffenen Profil-Felder über "profil" - nur die geänderten \
+Felder angeben, der Rest bleibt automatisch erhalten. Falls sich nichts Wesentliches geändert hat, \
+ist das ein völlig normales Ergebnis - dann bleibt "profil": null.
+
+Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
+{
+  "antwort": "deine Frage oder Zusammenfassung, kann Markdown enthalten",
+  "neue_aufgaben": [],
+  "profil": null,
+  "standbein_update": null
+}
+Falls sich Profil-relevante Dinge geändert haben, im selben Format aber mit den geänderten Feldern \
+in "profil" (nur die geänderten, z.B. nur {"sorge": "neue Sorge"} wenn nur das sich geändert hat)."""
+
+
 STRATEGY_SYSTEM_PROMPT = """Du hilfst dabei, die übergeordnete Vision einer Person zu schärfen, die \
 sich selbständig macht — möglicherweise mit mehreren gleichzeitigen Standbeinen/Geschäftsfeldern. \
 Die Person gibt einen groben, evtl. unstrukturierten Text zu ihrer übergeordneten Vision. Falls \
@@ -589,6 +626,26 @@ darauf ein - wie hängen die Standbeine zusammen, was ist das verbindende "Warum
 Formuliere daraus 2-4 klare, prägnante Sätze, die den Kern erfassen - nicht länger, nicht \
 ausschmückender als nötig. Antworte NUR mit dem geschärften Text, ohne Anführungszeichen, ohne \
 zusätzliche Erklärung."""
+
+
+PORTFOLIO_SYSTEM_PROMPT = """Du erstellst ein kurzes, professionelles Portfolio-Dokument (ca. \
+250-400 Wörter) für eine Person, basierend auf allem, was du über sie weisst (Profil, übergeordnete \
+Vision, Standbeine mit ihren jeweiligen Visionen, Meilensteinen und bisherigem Umsatz). Das Ziel: \
+ein Text, den die Person direkt an potenzielle Kund:innen, Partner:innen oder in Bewerbungen \
+verschicken könnte - überzeugend, konkret, ohne Übertreibung.
+
+Struktur:
+1. Ein kurzer, einprägsamer Einstiegsabsatz - wer die Person ist und was sie antreibt (nutze Name, \
+Hintergrund, Stärken aus dem Profil, falls vorhanden)
+2. Für jedes aktive Standbein einen kurzen Abschnitt - worum es geht, was schon erreicht wurde \
+(nutze konkrete Meilensteine/Umsatzzahlen, falls vorhanden, das macht es glaubwürdig statt vage)
+3. Ein kurzer, einladender Abschlusssatz
+
+Schreib im Fliesstext, keine Bullet-Points, keine Überschriften-Struktur wie ein Lebenslauf - das \
+soll sich wie eine überzeugende Selbstvorstellung lesen, nicht wie ein Formular. Erfinde KEINE \
+Fakten, Zahlen oder Erfolge, die nicht im Kontext stehen - falls wenig bekannt ist, bleib ehrlich \
+allgemeiner, statt etwas zu erfinden. Auf Deutsch. Antworte NUR mit dem fertigen Text, ohne \
+Anführungszeichen, ohne zusätzliche Erklärung davor oder danach."""
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +835,52 @@ def due_date_from_label(label: Optional[str]) -> Optional[str]:
     return None
 
 
+class ChatStartIn(BaseModel):
+    mode: str  # "checkin" oder "onboarding_full"
+
+
+@app.post("/chat/start")
+async def chat_start(payload: ChatStartIn, user: dict = Depends(get_current_user)):
+    """Erzeugt die EINSTIEGSFRAGE für eine Standortbestimmung oder ein komplettes
+    Neu-Onboarding — und speichert sie ECHT in der Datenbank (nicht nur im Browser
+    angezeigt), damit Claude beim nächsten Turn weiss, worauf sich die Antwort der
+    Person bezieht. Das war die eigentliche Ursache der Verwirrung beim letzten Mal."""
+    import json
+
+    with get_db() as conn:
+        memory = build_memory_context(conn, user["user_id"])
+
+    if payload.mode == "onboarding_full":
+        base_prompt = ONBOARDING_SYSTEM_PROMPT
+        kickoff = "Starte das Kennenlern-Gespräch von vorne mit der ersten Frage."
+    else:
+        base_prompt = CHECKIN_SYSTEM_PROMPT
+        kickoff = "Starte jetzt die Standortbestimmung mit deiner ersten Frage, basierend auf dem, was du bereits über mich weisst."
+
+    heute = datetime.now(timezone.utc).date()
+    wochentage = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+    heute_text = f"Heutiges Datum: {heute.isoformat()} ({wochentage[heute.weekday()]})"
+    system_prompt = f"{base_prompt}\n\n{heute_text}\n\n--- Bekannte Eckdaten der Person ---\n{memory}"
+
+    raw = await call_claude(system_prompt, [{"role": "user", "content": kickoff}])
+
+    try:
+        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(cleaned)
+        antwort = parsed.get("antwort", raw)
+    except (json.JSONDecodeError, AttributeError):
+        antwort = raw
+
+    with get_db() as conn:
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_assistant', ?, FALSE, ?)",
+            (user["user_id"], antwort, now_iso()),
+        )
+
+    return {"answer": antwort}
+
+
 @app.post("/chat")
 async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     import json
@@ -806,7 +909,12 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     ]
     messages.append({"role": "user", "content": payload.message})
 
-    base_prompt = ONBOARDING_SYSTEM_PROMPT if (not has_profile or payload.mode == "onboarding") else MENTOR_SYSTEM_PROMPT
+    if payload.mode == "checkin":
+        base_prompt = CHECKIN_SYSTEM_PROMPT
+    elif not has_profile or payload.mode == "onboarding":
+        base_prompt = ONBOARDING_SYSTEM_PROMPT
+    else:
+        base_prompt = MENTOR_SYSTEM_PROMPT
     heute = datetime.now(timezone.utc).date()
     wochentage = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
     heute_text = f"Heutiges Datum: {heute.isoformat()} ({wochentage[heute.weekday()]})"
@@ -1020,6 +1128,40 @@ async def generate_reflection(user: dict = Depends(get_current_user)):
     return {"text": text.strip()}
 
 
+# ---------------------------------------------------------------------------
+# Portfolio-Dokument — automatisch generiert aus Profil + Compass
+# ---------------------------------------------------------------------------
+
+@app.post("/portfolio/generate")
+async def generate_portfolio(user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        memory = build_memory_context(conn, user["user_id"])
+
+    text = await call_claude(
+        PORTFOLIO_SYSTEM_PROMPT,
+        [{"role": "user", "content": f"Hier ist der bisherige Kontext über die Person:\n\n{memory}"}],
+    )
+
+    with get_db() as conn:
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'portfolio_doc', ?, FALSE, ?)",
+            (user["user_id"], text.strip(), now_iso()),
+        )
+
+    return {"text": text.strip()}
+
+
+@app.get("/portfolio")
+def get_portfolio(user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        rows = fetch_entries(conn, user["user_id"], "portfolio_doc", limit=1)
+    return {
+        "text": rows[0]["content"] if rows else "",
+        "erstellt_am": rows[0]["created_at"][:10] if rows else None,
+    }
+
+
 @app.get("/profile/journey")
 def get_journey(user: dict = Depends(get_current_user)):
     """Stellt Statistiken für die 'Deine Reise'-Übersicht zusammen: seit wann dabei,
@@ -1081,10 +1223,17 @@ class MeilensteinIn(BaseModel):
     messgroesse: str = ""  # "Wie misst du, ob's erreicht ist?" — optional
 
 
+class UmsatzEintragIn(BaseModel):
+    betrag: float
+    datum: Optional[str] = None  # ISO-Datum YYYY-MM-DD, optional
+    notiz: str = ""
+
+
 class VentureIn(BaseModel):
     name: str
     vision: str = ""
     meilensteine: list[MeilensteinIn] = []
+    umsatz: list[UmsatzEintragIn] = []
 
 
 def normalize_meilensteine(raw) -> list:
@@ -1105,6 +1254,14 @@ def normalize_meilensteine(raw) -> list:
     return []
 
 
+def normalize_umsatz(raw) -> list:
+    """Gibt eine leere Liste zurück, falls noch keine Umsatz-Einträge vorhanden sind
+    (z.B. bei älteren Standbeinen, die vor diesem Feature angelegt wurden)."""
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
 @app.get("/strategy")
 def get_strategy(user: dict = Depends(get_current_user)):
     import json
@@ -1119,6 +1276,7 @@ def get_strategy(user: dict = Depends(get_current_user)):
             data = json.loads(v["content"])
             data["id"] = v["id"]
             data["meilensteine"] = normalize_meilensteine(data.get("meilensteine"))
+            data["umsatz"] = normalize_umsatz(data.get("umsatz"))
             ventures.append(data)
         except (json.JSONDecodeError, TypeError):
             continue
@@ -1277,6 +1435,110 @@ async def send_weekly_digests(x_cron_secret: str = Header(None)):
             sent_count += 1
 
     return {"ok": True, "sent": sent_count, "total_users": len(users)}
+
+
+# ---------------------------------------------------------------------------
+# Kalender-Abo (iCal / .ics) — funktioniert mit Google Kalender, Apple Kalender,
+# Outlook. Nutzt einen geheimen Token in der URL statt Login, weil Kalender-Apps
+# keine Bearer-Token-Header mitschicken können.
+# ---------------------------------------------------------------------------
+
+@app.get("/calendar/token")
+def get_calendar_token(user: dict = Depends(get_current_user)):
+    """Gibt den persönlichen Kalender-Token zurück, erzeugt ihn falls noch keiner existiert."""
+    with get_db() as conn:
+        rows = run_query(conn, "SELECT calendar_token FROM users WHERE id = ?", (user["user_id"],))
+        token = rows[0]["calendar_token"] if rows else None
+        if not token:
+            token = secrets.token_urlsafe(24)
+            run_write(conn, "UPDATE users SET calendar_token = ? WHERE id = ?", (token, user["user_id"]))
+    return {"token": token}
+
+
+def escape_ics_text(text: str) -> str:
+    """Escaped Sonderzeichen gemäss iCalendar-Spezifikation."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\n", "\\n")
+    )
+
+
+@app.get("/calendar/{token}.ics")
+def get_ics_feed(token: str):
+    """Öffentlicher (aber geheimer) Kalender-Feed — kein Login nötig, nur der Token
+    in der URL. Enthält alle Aufgaben mit Fälligkeitsdatum als ganztägige Termine."""
+    with get_db() as conn:
+        rows = run_query(conn, "SELECT id FROM users WHERE calendar_token = ?", (token,))
+        if not rows:
+            raise HTTPException(status_code=404, detail="Ungültiger Kalender-Link.")
+        user_id = rows[0]["id"]
+        tasks = fetch_entries(conn, user_id, "task", limit=1000)
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Sole.//Aufgaben-Kalender//DE",
+        "CALSCALE:GREGORIAN",
+        "X-WR-CALNAME:Sole. Aufgaben",
+    ]
+
+    for t in tasks:
+        if not t["due_date"]:
+            continue
+        due_compact = t["due_date"].replace("-", "")
+        prefix = "✓ " if t["done"] else ""
+        summary = escape_ics_text(prefix + t["content"])
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:sole-task-{t['id']}@sole-app",
+            f"DTSTART;VALUE=DATE:{due_compact}",
+            f"DTEND;VALUE=DATE:{due_compact}",
+            f"SUMMARY:{summary}",
+            f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+            "END:VEVENT",
+        ]
+
+    lines.append("END:VCALENDAR")
+    ics_content = "\r\n".join(lines)
+
+    from fastapi.responses import Response
+    return Response(
+        content=ics_content,
+        media_type="text/calendar; charset=utf-8",
+        headers={"Content-Disposition": "inline; filename=sole-aufgaben.ics"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Datenexport — alle eigenen Daten als JSON-Datei zum Download.
+# ---------------------------------------------------------------------------
+
+@app.get("/export")
+def export_data(user: dict = Depends(get_current_user)):
+    import json as json_module
+
+    with get_db() as conn:
+        all_entries = run_query(
+            conn, "SELECT * FROM entries WHERE user_id = ? ORDER BY id", (user["user_id"],)
+        )
+        user_rows = run_query(
+            conn, "SELECT email, created_at FROM users WHERE id = ?", (user["user_id"],)
+        )
+
+    export = {
+        "exportiert_am": now_iso(),
+        "konto": user_rows[0] if user_rows else {},
+        "eintraege": all_entries,
+    }
+
+    from fastapi.responses import Response
+    return Response(
+        content=json_module.dumps(export, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=sole-daten-export.json"},
+    )
 
 
 @app.get("/health")
