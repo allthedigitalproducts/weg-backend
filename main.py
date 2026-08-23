@@ -484,11 +484,14 @@ leer/null - das ist der Normalfall, nicht die Ausnahme.
 4. STANDBEINE UND MEILENSTEINE ERKENNEN: Wenn im Gespräch über ein konkretes Geschäftsfeld/Projekt \
 gesprochen wird (z.B. ein Name dafür vergeben wird, eine Vision/Zahlen/Ziele genannt werden, oder \
 konkrete Meilensteine besprochen werden) - trag das in "standbein_update" ein, damit es auf der \
-Strategy-Seite sichtbar wird, statt nur im Chat-Verlauf zu verschwinden. Nutze den Namen, den die \
+Compass-Seite sichtbar wird, statt nur im Chat-Verlauf zu verschwinden. Nutze den Namen, den die \
 Person selbst für das Projekt gewählt hat (falls noch keiner genannt wurde, warte damit, statt \
 selbst einen zu erfinden). Ergänze nur, was WIRKLICH in diesem Gespräch besprochen wurde - keine \
-Meilensteine erfinden. Bei den meisten Nachrichten bleibt "standbein_update" leer/null - nur \
-eintragen, wenn wirklich neue, strategisch relevante Standbein-Information genannt wurde.
+Meilensteine erfinden. Falls erkennbar ist, in welcher Phase sich das Standbein aktuell befindet \
+("idee", "validieren", "aufbauen", "umsetzen", "wachsen" - fünf Stufen), gib das als "phase" mit an \
+- aber nur, wenn es wirklich aus dem Gespräch hervorgeht, nicht raten. Bei den meisten Nachrichten \
+bleibt "standbein_update" leer/null - nur eintragen, wenn wirklich neue, strategisch relevante \
+Standbein-Information genannt wurde.
 
 Weitere Regeln:
 - Antworte warm, aber sachlich - keine übertriebene Cheerleader-Sprache.
@@ -525,6 +528,7 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
   "standbein_update": {
     "name": "Name des Standbeins, wie die Person es selbst nennt",
     "vision": "kurze Vision/Zahlen/Ziele, so wie besprochen",
+    "phase": "idee | validieren | aufbauen | umsetzen | wachsen (nur falls erkennbar, sonst weglassen)",
     "meilensteine": [
       {"text": "konkreter Meilenstein", "datum": "2026-08-25 oder null", "messgroesse": "optional"}
     ]
@@ -992,6 +996,10 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 venture_id, v_data = passendes_venture
                 if standbein_update.get("vision"):
                     v_data["vision"] = standbein_update["vision"]
+                if standbein_update.get("phase") in VENTURE_PHASES:
+                    v_data["phase"] = standbein_update["phase"]
+                elif v_data.get("phase") not in VENTURE_PHASES:
+                    v_data["phase"] = "idee"
                 bestehende_meilensteine = normalize_meilensteine(v_data.get("meilensteine"))
                 bestehende_texte = {m.get("text", "").strip().lower() for m in bestehende_meilensteine}
                 for m in neue_meilensteine:
@@ -1003,6 +1011,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                             "messgroesse": m.get("messgroesse", ""),
                         })
                 v_data["meilensteine"] = bestehende_meilensteine
+                v_data["umsatz"] = normalize_umsatz(v_data.get("umsatz"))
                 run_write(
                     conn,
                     "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
@@ -1013,6 +1022,8 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 neues_venture = {
                     "name": standbein_update["name"],
                     "vision": standbein_update.get("vision", ""),
+                    "phase": standbein_update.get("phase") if standbein_update.get("phase") in VENTURE_PHASES else "idee",
+                    "umsatz": [],
                     "meilensteine": [
                         {
                             "text": m.get("text", ""),
@@ -1229,11 +1240,15 @@ class UmsatzEintragIn(BaseModel):
     notiz: str = ""
 
 
+VENTURE_PHASES = ["idee", "validieren", "aufbauen", "umsetzen", "wachsen"]
+
+
 class VentureIn(BaseModel):
     name: str
     vision: str = ""
     meilensteine: list[MeilensteinIn] = []
     umsatz: list[UmsatzEintragIn] = []
+    phase: str = "idee"
 
 
 def normalize_meilensteine(raw) -> list:
@@ -1277,6 +1292,8 @@ def get_strategy(user: dict = Depends(get_current_user)):
             data["id"] = v["id"]
             data["meilensteine"] = normalize_meilensteine(data.get("meilensteine"))
             data["umsatz"] = normalize_umsatz(data.get("umsatz"))
+            if data.get("phase") not in VENTURE_PHASES:
+                data["phase"] = "idee"
             ventures.append(data)
         except (json.JSONDecodeError, TypeError):
             continue
