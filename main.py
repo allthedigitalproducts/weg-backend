@@ -110,6 +110,17 @@ if USE_POSTGRES:
             # Migration-safe: falls die Tabelle schon vorher ohne diese Spalten existierte
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS parent_id INTEGER")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS due_date TEXT")
+            # V1-Erweiterung (Aug 2026): reicheres Task-Modell. Bestehende
+            # Spalten (done, due_date) bleiben unverändert für das alte
+            # Frontend — diese Spalten sind rein additiv.
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'open'")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS deadline TEXT")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS estimated_minutes INTEGER")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS venture_id INTEGER")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS milestone_text TEXT")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS sole_priority INTEGER")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS priority_reason TEXT")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual'")
 
     def run_query(conn, query: str, params: tuple = ()):
         """Führt eine Query aus und gibt eine Liste von dicts zurück (SELECT)."""
@@ -174,7 +185,14 @@ else:
                 )
             """)
             # Migration-safe: falls die Tabelle schon vorher ohne diese Spalten existierte
-            for col_def in ["parent_id INTEGER", "due_date TEXT"]:
+            for col_def in [
+                "parent_id INTEGER", "due_date TEXT",
+                # V1-Erweiterung (Aug 2026): reicheres Task-Modell, additiv,
+                # bestehende Spalten bleiben für das alte Frontend unverändert.
+                "status TEXT DEFAULT 'open'", "deadline TEXT", "estimated_minutes INTEGER",
+                "venture_id INTEGER", "milestone_text TEXT", "sole_priority INTEGER",
+                "priority_reason TEXT", "source TEXT DEFAULT 'manual'",
+            ]:
                 try:
                     conn.execute(f"ALTER TABLE entries ADD COLUMN {col_def}")
                 except sqlite3.OperationalError:
@@ -200,6 +218,13 @@ class EntryIn(BaseModel):
     type: str
     content: str
     due_date: Optional[str] = None
+    # V1-Erweiterung — alle optional, altes Frontend nutzt sie einfach nicht.
+    status: Optional[str] = None  # "open" | "done" | "not-relevant"
+    deadline: Optional[str] = None
+    estimated_minutes: Optional[int] = None
+    venture_id: Optional[int] = None
+    milestone_text: Optional[str] = None
+    source: Optional[str] = "manual"
 
 
 class EntryUpdate(BaseModel):
@@ -207,6 +232,15 @@ class EntryUpdate(BaseModel):
     content: Optional[str] = None
     due_date: Optional[str] = None
     clear_due_date: bool = False  # explizit auf "kein Datum" zurücksetzen
+    # V1-Erweiterung
+    status: Optional[str] = None
+    deadline: Optional[str] = None
+    clear_deadline: bool = False
+    estimated_minutes: Optional[int] = None
+    venture_id: Optional[int] = None
+    milestone_text: Optional[str] = None
+    sole_priority: Optional[int] = None
+    priority_reason: Optional[str] = None
 
 
 class ChatIn(BaseModel):
@@ -728,11 +762,22 @@ def list_entries(type: Optional[str] = None, user: dict = Depends(get_current_us
 
 @app.post("/entries")
 def create_entry(entry: EntryIn, user: dict = Depends(get_current_user)):
+    # done bleibt für's alte Frontend die Wahrheit; falls status mitgeschickt
+    # wird (neues Frontend), wird done konsistent daraus abgeleitet.
+    initial_done = (entry.status == "done") if entry.status else False
+    initial_status = entry.status or "open"
     with get_db() as conn:
         new_id = run_write(
             conn,
-            "INSERT INTO entries (user_id, type, content, done, due_date, created_at) VALUES (?, ?, ?, FALSE, ?, ?)",
-            (user["user_id"], entry.type, entry.content, entry.due_date, now_iso()),
+            """INSERT INTO entries
+               (user_id, type, content, done, due_date, status, deadline,
+                estimated_minutes, venture_id, milestone_text, source, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user["user_id"], entry.type, entry.content, initial_done, entry.due_date,
+                initial_status, entry.deadline, entry.estimated_minutes, entry.venture_id,
+                entry.milestone_text, entry.source or "manual", now_iso(),
+            ),
         )
         return {"id": new_id}
 
@@ -740,11 +785,23 @@ def create_entry(entry: EntryIn, user: dict = Depends(get_current_user)):
 @app.patch("/entries/{entry_id}")
 def update_entry(entry_id: int, update: EntryUpdate, user: dict = Depends(get_current_user)):
     with get_db() as conn:
-        if update.done is not None:
+        # done <-> status bleiben synchron, damit altes und neues Frontend
+        # dieselbe Wahrheit sehen, egal welches von beiden gesendet hat.
+        if update.status is not None:
+            derived_done = update.status == "done"
             run_write(
                 conn,
-                "UPDATE entries SET done = ? WHERE id = ? AND user_id = ?",
-                (update.done, entry_id, user["user_id"]),
+                "UPDATE entries SET status = ?, done = ? WHERE id = ? AND user_id = ?",
+                (update.status, derived_done, entry_id, user["user_id"]),
+            )
+        elif update.done is not None:
+            # Altes Frontend kennt nur true/false: true -> "done",
+            # false -> "open" (kann kein "not-relevant" ausdrücken).
+            derived_status = "done" if update.done else "open"
+            run_write(
+                conn,
+                "UPDATE entries SET done = ?, status = ? WHERE id = ? AND user_id = ?",
+                (update.done, derived_status, entry_id, user["user_id"]),
             )
         if update.content is not None:
             run_write(
@@ -763,6 +820,48 @@ def update_entry(entry_id: int, update: EntryUpdate, user: dict = Depends(get_cu
                 conn,
                 "UPDATE entries SET due_date = ? WHERE id = ? AND user_id = ?",
                 (update.due_date, entry_id, user["user_id"]),
+            )
+        if update.clear_deadline:
+            run_write(
+                conn,
+                "UPDATE entries SET deadline = NULL WHERE id = ? AND user_id = ?",
+                (entry_id, user["user_id"]),
+            )
+        elif update.deadline is not None:
+            run_write(
+                conn,
+                "UPDATE entries SET deadline = ? WHERE id = ? AND user_id = ?",
+                (update.deadline, entry_id, user["user_id"]),
+            )
+        if update.estimated_minutes is not None:
+            run_write(
+                conn,
+                "UPDATE entries SET estimated_minutes = ? WHERE id = ? AND user_id = ?",
+                (update.estimated_minutes, entry_id, user["user_id"]),
+            )
+        if update.venture_id is not None:
+            run_write(
+                conn,
+                "UPDATE entries SET venture_id = ? WHERE id = ? AND user_id = ?",
+                (update.venture_id, entry_id, user["user_id"]),
+            )
+        if update.milestone_text is not None:
+            run_write(
+                conn,
+                "UPDATE entries SET milestone_text = ? WHERE id = ? AND user_id = ?",
+                (update.milestone_text, entry_id, user["user_id"]),
+            )
+        if update.sole_priority is not None:
+            run_write(
+                conn,
+                "UPDATE entries SET sole_priority = ? WHERE id = ? AND user_id = ?",
+                (update.sole_priority, entry_id, user["user_id"]),
+            )
+        if update.priority_reason is not None:
+            run_write(
+                conn,
+                "UPDATE entries SET priority_reason = ? WHERE id = ? AND user_id = ?",
+                (update.priority_reason, entry_id, user["user_id"]),
             )
         return {"ok": True}
 
@@ -1061,6 +1160,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
 PROFILE_FIELDS = [
     "name", "situation", "hintergrund", "vision", "erfolg", "sorge", "reserve", "stil",
     "staerken", "werte", "unterstuetzung",
+    "arbeitsweise", "rahmen", "ziel",
 ]
 
 
@@ -1076,6 +1176,11 @@ class ProfileIn(BaseModel):
     staerken: str = ""
     werte: str = ""
     unterstuetzung: str = ""
+    # V1-Erweiterung — zusätzliche Facts-Felder, altes Frontend nutzt sie nicht,
+    # bestehende Felder oben bleiben unverändert erhalten.
+    arbeitsweise: str = ""
+    rahmen: str = ""
+    ziel: str = ""
 
 
 @app.get("/profile")
@@ -1241,6 +1346,7 @@ class UmsatzEintragIn(BaseModel):
 
 
 VENTURE_PHASES = ["idee", "validieren", "aufbauen", "umsetzen", "wachsen"]
+VENTURE_FOCUS_OPTIONS = ["primary", "secondary", "parked"]
 
 
 class VentureIn(BaseModel):
@@ -1249,6 +1355,8 @@ class VentureIn(BaseModel):
     meilensteine: list[MeilensteinIn] = []
     umsatz: list[UmsatzEintragIn] = []
     phase: str = "idee"
+    role: str = ""
+    focus: str = "secondary"
 
 
 def normalize_meilensteine(raw) -> list:
@@ -1294,6 +1402,10 @@ def get_strategy(user: dict = Depends(get_current_user)):
             data["umsatz"] = normalize_umsatz(data.get("umsatz"))
             if data.get("phase") not in VENTURE_PHASES:
                 data["phase"] = "idee"
+            if data.get("focus") not in VENTURE_FOCUS_OPTIONS:
+                data["focus"] = "secondary"
+            if "role" not in data:
+                data["role"] = ""
             ventures.append(data)
         except (json.JSONDecodeError, TypeError):
             continue
