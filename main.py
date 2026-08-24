@@ -252,6 +252,11 @@ class ChatIn(BaseModel):
     # zurückgegeben — das alte Frontend sendet dieses Feld nicht und behält
     # das bisherige Auto-Speichern-Verhalten unverändert bei.
     confirm_mode: bool = False
+    # Wird nur nach einem Erreichbarkeits-Fehler gesendet: die Nachricht
+    # wurde beim gescheiterten Versuch bereits gespeichert, hier soll NICHT
+    # nochmal ein chat_user-Eintrag entstehen, nur eine frische Antwort
+    # angefordert werden.
+    retry_only: bool = False
 
 
 class GoalIn(BaseModel):
@@ -427,24 +432,37 @@ async def call_claude(system_prompt: str, messages: list[dict]) -> str:
             detail="ANTHROPIC_API_KEY ist nicht gesetzt. Siehe README.md.",
         )
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 1000,
-                "system": system_prompt,
-                "messages": messages,
-            },
-        )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Anthropic API Fehler: {response.text}")
+    # Bis zu zwei Versuche: bei langen Gesprächen (viel Kontext = mehr
+    # Verarbeitungszeit) kommt es gelegentlich zu einem Timeout oder einem
+    # kurzen Netzwerk-Hänger bei Anthropic selbst - ein zweiter Versuch löst
+    # das meistens, ohne dass die Person "Sole ist nicht erreichbar" sieht.
+    letzter_fehler = None
+    for versuch in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=55.0) as client:
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": ANTHROPIC_MODEL,
+                        "max_tokens": 1000,
+                        "system": system_prompt,
+                        "messages": messages,
+                    },
+                )
+            if response.status_code == 200:
+                break
+            letzter_fehler = HTTPException(status_code=502, detail=f"Anthropic API Fehler: {response.text}")
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+            letzter_fehler = HTTPException(status_code=503, detail=f"Anthropic API nicht erreichbar: {exc}")
+            continue
+    else:
+        # Beide Versuche fehlgeschlagen
+        raise letzter_fehler
 
     data = response.json()
     text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
@@ -538,15 +556,24 @@ Reflexion statt reinem Enthusiasmus anzuregen.
 erwähnt hat. Frag nach, biete Perspektiven, statt die erste Idee unhinterfragt zu bestärken.
 - Erinnere die Person bei Gelegenheit an ihr strategisches Ziel/ihre Vision (falls im Kontext \
 vorhanden), besonders wenn die aktuelle Nachricht davon abzuweichen scheint.
+- SEI AKTIV FÜHREND, NICHT NUR REAGIEREND: Ein guter Mentor beantwortet nicht nur die gestellte \
+Frage, sondern denkt von sich aus mit, was als Nächstes sinnvoll wäre. Wenn sich aus dem Gespräch \
+ein konkreter nächster Schritt ergibt (auch wenn nicht explizit danach gefragt wurde), sprich ihn \
+aktiv an - "Ich würde als Nächstes X machen" statt nur abzuwarten, bis die Person selbst fragt \
+"was soll ich jetzt tun". Warte nicht passiv auf die perfekte Steilvorlage - biete eine Richtung an, \
+auch unaufgefordert, wenn der Kontext genug hergibt. Das gilt besonders, wenn die Person unschlüssig \
+wirkt oder mehrere offene Fäden gleichzeitig hat.
 
-3. FORTLAUFENDE NOTIZEN FÜHREN (sehr sparsam einsetzen): Du führst im Hintergrund eigene, \
-wachsende Notizen über die Person - wie ein Mentor, der sich über Monate Beobachtungen macht, die \
-über die starren Profilfelder hinausgehen. NUR wenn du in DIESEM Gespräch etwas wirklich \
-Bedeutsames und Bleibendes über die Person lernst (ein Charakterzug, ein wiederkehrendes Muster, \
-ein Arbeitsstil, eine Erkenntnis über ihre Motivation) - schreib einen kurzen Absatz (2-4 Sätze) \
-dazu in "notiz_update". Das ist NICHT für alltägliche Dinge (nicht "hat heute X erledigt") - nur \
-für echte, längerfristig relevante Einsichten. Bei den meisten Nachrichten bleibt "notiz_update" \
-leer/null - das ist der Normalfall, nicht die Ausnahme.
+3. FORTLAUFENDE NOTIZEN FÜHREN: Du führst im Hintergrund eigene, wachsende Notizen über die \
+Person - wie ein Mentor, der sich über Monate Beobachtungen macht, die über die starren \
+Profilfelder hinausgehen. Wenn du in DIESEM Gespräch etwas wirklich Bedeutsames über die Person \
+lernst (ein Charakterzug, ein wiederkehrendes Muster, ein Arbeitsstil, eine Erkenntnis über ihre \
+Motivation, eine Entscheidung, die etwas über ihre Prioritäten verrät) - schreib einen kurzen \
+Absatz (2-4 Sätze) dazu in "notiz_update". Das ist NICHT für alltägliche Dinge (nicht "hat heute X \
+erledigt") - aber auch nicht nur für die eine grosse Ausnahme im Jahr. Ein längeres, inhaltlich \
+reiches Gespräch sollte fast immer mindestens EINE solche Beobachtung hergeben - wenn nach vielen \
+Nachrichten hin und her "notiz_update" durchgehend leer bleibt, ist das eher ein Zeichen, dass zu \
+zurückhaltend erkannt wird, als dass wirklich nichts Bemerkenswertes gesagt wurde.
 
 4. STANDBEINE UND MEILENSTEINE ERKENNEN: Wenn im Gespräch über ein konkretes Geschäftsfeld/Projekt \
 gesprochen wird (z.B. ein Name dafür vergeben wird, eine Vision/Zahlen/Ziele genannt werden, oder \
@@ -556,9 +583,22 @@ Person selbst für das Projekt gewählt hat (falls noch keiner genannt wurde, wa
 selbst einen zu erfinden). Ergänze nur, was WIRKLICH in diesem Gespräch besprochen wurde - keine \
 Meilensteine erfinden. Falls erkennbar ist, in welcher Phase sich das Standbein aktuell befindet \
 ("idee", "validieren", "aufbauen", "umsetzen", "wachsen" - fünf Stufen), gib das als "phase" mit an \
-- aber nur, wenn es wirklich aus dem Gespräch hervorgeht, nicht raten. Bei den meisten Nachrichten \
-bleibt "standbein_update" leer/null - nur eintragen, wenn wirklich neue, strategisch relevante \
-Standbein-Information genannt wurde.
+- aber nur, wenn es wirklich aus dem Gespräch hervorgeht, nicht raten. Sei dabei angemessen \
+aufmerksam, nicht übervorsichtig: du musst nicht auf eine perfekt explizite Ankündigung warten - \
+wenn im normalen Gesprächsfluss klar erkennbar über ein bestehendes oder neues Standbein gesprochen \
+wird, trag es ein, auch wenn die Person es nicht extra als "das ist jetzt mein Standbein" ankündigt. \
+Bei den meisten Nachrichten bleibt "standbein_update" trotzdem leer/null, wenn schlicht kein \
+Standbein-Thema vorkommt.
+
+5. PROFIL-INFORMATION ERKENNEN: Wenn die Person im normalen Gespräch etwas wirklich Bedeutsames \
+über sich, ihre Situation, ihre Ziele oder Arbeitsweise preisgibt (nicht im Onboarding/Check-in, \
+sondern beiläufig im normalen Sparring) - trag das in "profil_update" ein, mit genau den Feldern, \
+die sich geändert haben (mögliche Felder: "situation", "ziel", "rahmen", "arbeitsweise", "stil", \
+"hintergrund", "reserve" - nur die, die wirklich neu/geändert sind, nicht das ganze Profil \
+wiederholen). Beispiel: die Person erwähnt beiläufig "ich will eigentlich nie mehr als vier Tage \
+die Woche arbeiten" - das ist ein "rahmen"-Update wert. Nicht für alltägliche, flüchtige Aussagen - \
+nur für Dinge, die eine zukünftige Empfehlung wirklich verändern würden. Bei den meisten \
+Nachrichten bleibt "profil_update" leer/null.
 
 Weitere Regeln:
 - Antworte ruhig, präzise, direkt - keine übertriebene Cheerleader-Sprache, keine generischen \
@@ -587,6 +627,14 @@ und beziehe dich bei Gelegenheit auf die genannten Punkte.
 aktuelle Nachricht Hinweise auf eine veränderte Situation gibt (z.B. neue Rolle, grosser Wechsel \
 erwähnt): frag beiläufig, ob sich an der Grundsituation etwas geändert hat - aber nicht bei jeder \
 Nachricht, nur wenn es wirklich passt.
+- WICHTIGER GRUNDSATZ FÜR ALLE VIER ERKENNUNGS-FUNKTIONEN OBEN (Aufgabe/Notiz/Standbein/Profil): \
+die Person sieht jeden Vorschlag erst als Karte und bestätigt ihn selbst - nichts wird ungefragt \
+gespeichert. Deshalb kostet ein Vorschlag, der abgelehnt wird, fast nichts; ein Vorschlag, der nie \
+gemacht wird, obwohl er inhaltlich dagewesen wäre, kostet dagegen den ganzen Sinn des Gesprächs - \
+die Person hat dann stundenlang mit dir geredet, ohne dass etwas Sichtbares dabei entstanden ist. \
+Im Zweifel also lieber einen Vorschlag machen (die Person kann ihn ablehnen), als zu zurückhaltend \
+zu sein und am Ende eines langen, inhaltlich reichen Gesprächs bei allen vier Feldern durchgehend \
+leer zu bleiben.
 
 Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
 {
@@ -597,7 +645,12 @@ Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
     {"inhalt": "andere Aufgabe", "faellig": null}
   ],
   "notiz_update": null,
-  "standbein_update": null
+  "standbein_update": null,
+  "profil_update": null
+}
+Falls Profil-relevante Information erkannt wurde, statt null:
+{
+  "profil_update": {"rahmen": "möchte nie mehr als vier Tage pro Woche arbeiten"}
 }
 Falls ein Standbein wirklich besprochen wurde, statt null:
 {
@@ -644,6 +697,15 @@ Sobald alle acht Bereiche abgedeckt sind: fasse kurz zusammen, was du verstanden
 explizit nach Bestätigung ("Hab ich das richtig verstanden? ..."). Erst wenn die Person bestätigt \
 (z.B. "ja", "passt", "stimmt so"), gibst du das strukturierte Profil im JSON zurück (siehe unten) - \
 vorher immer "profil": null.
+
+WICHTIG: In genau der Antwort, in der du das Profil ausfüllst (also der Bestätigungs-Antwort auf \
+"ja"/"passt"), darf "antwort" KEINE neue offene Frage mehr enthalten - keine Anschlussfrage wie \
+"Erzähl mir von deinen Ideen" im selben Atemzug. Diese Antwort ist ein sauberer Abschluss des \
+Kennenlern-Gesprächs, nichts weiter (z.B. "Perfekt, [Name] - dann sind wir startklar."). Die \
+Person bekommt danach eine eigene Zusammenfassungs-Ansicht zu sehen und entscheidet selbst, wann \
+sie weitermacht - eine neue Frage in derselben Antwort würde untergehen, weil niemand mehr darauf \
+antworten kann. Der nächste inhaltliche Schritt (z.B. nach den Ideen fragen) gehört in die \
+darauffolgende Nachricht, nicht in diese.
 
 Halte den Ton warm, persönlich, aber zielgerichtet - das ist ein Kennenlernen, kein Verhör.
 
@@ -932,6 +994,36 @@ def clear_chat_history(user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
+@app.get("/chat/dates")
+def get_chat_dates(user: dict = Depends(get_current_user)):
+    """Liste aller Tage (YYYY-MM-DD), an denen es Chat-Nachrichten gibt — für den
+    Datums-Sprung im Frontend (WhatsApp-artig: Tag anklicken statt endlos scrollen)."""
+    with get_db() as conn:
+        rows = run_query(
+            conn,
+            "SELECT created_at FROM entries WHERE user_id = ? AND type IN ('chat_user', 'chat_assistant')",
+            (user["user_id"],),
+        )
+    dates = sorted({row["created_at"][:10] for row in rows if row.get("created_at")})
+    return {"dates": dates}
+
+
+@app.get("/chat/history")
+def get_chat_history_by_date(date: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """Chat-Nachrichten für EINEN Tag, nicht den ganzen Verlauf — Default ist heute.
+    Bewusst kein endloses Zusammenhängen mehrerer Tage; das Frontend zeigt jeweils
+    nur den gewählten Tag."""
+    target_date = date or datetime.now(timezone.utc).date().isoformat()
+    with get_db() as conn:
+        rows = run_query(
+            conn,
+            "SELECT * FROM entries WHERE user_id = ? AND type IN ('chat_user', 'chat_assistant') "
+            "AND created_at LIKE ? ORDER BY id ASC",
+            (user["user_id"], f"{target_date}%"),
+        )
+    return {"date": target_date, "messages": rows}
+
+
 @app.delete("/account/reset")
 def reset_account_data(user: dict = Depends(get_current_user)):
     """Löscht ALLE Daten des Accounts (Aufgaben, Standbeine, Profil, Notizen,
@@ -1149,17 +1241,23 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         )
         previous_turns = list(reversed(previous_turns))  # chronologisch aufsteigend
 
-        run_write(
-            conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_user', ?, FALSE, ?)",
-            (user["user_id"], payload.message, now_iso()),
-        )
+        if not payload.retry_only:
+            # Normalfall: neue Nachricht wirklich speichern.
+            run_write(
+                conn,
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_user', ?, FALSE, ?)",
+                (user["user_id"], payload.message, now_iso()),
+            )
+        # Bei retry_only=True wurde die Nachricht beim gescheiterten Versuch
+        # bereits gespeichert und steckt schon als letzter Eintrag in
+        # previous_turns - hier NICHT nochmal einfügen.
 
     messages = [
         {"role": "user" if t["type"] == "chat_user" else "assistant", "content": t["content"]}
         for t in previous_turns
     ]
-    messages.append({"role": "user", "content": payload.message})
+    if not payload.retry_only:
+        messages.append({"role": "user", "content": payload.message})
 
     if payload.mode == "checkin":
         base_prompt = CHECKIN_SYSTEM_PROMPT
@@ -1181,6 +1279,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         neues_profil = parsed.get("profil")
         notiz_update = parsed.get("notiz_update")
         standbein_update = parsed.get("standbein_update")
+        profil_update = parsed.get("profil_update")  # aus dem normalen Mentor-Gespräch, nicht Onboarding
     except (json.JSONDecodeError, AttributeError):
         # Falls das Parsen fehlschlägt, nutzen wir die Rohantwort ohne Extraktion,
         # damit der Chat trotzdem funktioniert, statt komplett zu scheitern.
@@ -1189,6 +1288,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         neues_profil = None
         notiz_update = None
         standbein_update = None
+        profil_update = None
 
     with get_db() as conn:
         run_write(
@@ -1231,6 +1331,14 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                     "label": f"Standbein: {standbein_update['name']}",
                     "payload": standbein_update,
                 })
+
+            if isinstance(profil_update, dict) and profil_update:
+                feld_namen = ", ".join(profil_update.keys())
+                vorschlaege.append({
+                    "kind": "profil",
+                    "label": f"Profil aktualisieren ({feld_namen})",
+                    "payload": profil_update,
+                })
         else:
             # Altes Verhalten, unverändert für das bestehende Frontend:
             # sofort automatisch speichern.
@@ -1246,6 +1354,10 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 create_notiz_entry(conn, user["user_id"], notiz_update)
 
             standbein_gespeichert = apply_standbein_update(conn, user["user_id"], standbein_update)
+
+            if isinstance(profil_update, dict) and profil_update:
+                save_profile_merged(conn, user["user_id"], profil_update)
+                profil_gespeichert = True
 
     return {
         "answer": antwort,
@@ -1274,6 +1386,8 @@ def confirm_suggestion(body: SuggestionConfirmIn, user: dict = Depends(get_curre
             create_notiz_entry(conn, user["user_id"], body.payload.get("text", ""))
         elif body.kind == "standbein":
             apply_standbein_update(conn, user["user_id"], body.payload)
+        elif body.kind == "profil":
+            save_profile_merged(conn, user["user_id"], body.payload)
         else:
             raise HTTPException(status_code=400, detail=f"Unbekannte Vorschlagsart: {body.kind}")
     return {"ok": True}
@@ -1372,6 +1486,80 @@ async def generate_reflection(user: dict = Depends(get_current_user)):
         )
 
     return {"text": text.strip()}
+
+
+DAILY_FOCUS_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person öffnet gerade ihre Übersicht \
+und braucht eine klare, begründete Einschätzung: worauf sollte sie sich HEUTE konzentrieren?
+
+Du bekommst unten den bekannten Kontext (Profil, Vision, Standbeine, Meilensteine) sowie die \
+offenen Aufgaben für heute. Antworte NUR als JSON, ohne zusätzlichen Text:
+{
+  "headline": "kurzer, klarer Satz mit Haltung, z.B. 'Heute würde ich auf Akquise setzen.'",
+  "reasoning": "1-3 Sätze Begründung, warum genau das gerade zählt - konkret, nicht generisch",
+  "task_text": "EXAKT der Titel einer der unten aufgeführten offenen Aufgaben für heute, die am besten zu deiner Empfehlung passt, oder null falls keine passt oder keine Aufgaben vorhanden sind"
+}
+
+Wichtig: "task_text" muss EXAKT (Zeichen für Zeichen) einem der unten aufgeführten Aufgaben-Titel \
+entsprechen, sonst null - erfinde keinen Titel. Falls der Kontext zu dünn ist, um eine echte, \
+begründete Empfehlung abzugeben (z.B. kaum Aufgaben, keine erkennbare Priorität), sag das ehrlich \
+in "headline" statt eine beliebige Aufgabe hervorzuheben - z.B. "headline": "Bevor ich dir etwas \
+empfehle:" und "reasoning": eine gezielte Rückfrage statt einer Begründung."""
+
+
+@app.get("/dashboard/focus")
+async def get_daily_focus(user: dict = Depends(get_current_user)):
+    """Liefert den strategischen Tages-Fokus — einmal pro Tag generiert, danach aus der DB
+    wiederverwendet (kein neuer KI-Aufruf bei jedem Übersichts-Aufruf). Gibt None zurück, wenn
+    gar keine offenen Aufgaben für heute existieren - dann zeigt das Frontend den vorgesehenen
+    Leerzustand, statt etwas zu erfinden."""
+    import json
+
+    heute = datetime.now(timezone.utc).date().isoformat()
+
+    with get_db() as conn:
+        bestehende = fetch_entries(conn, user["user_id"], "daily_focus", limit=5)
+        for entry in bestehende:
+            try:
+                data = json.loads(entry["content"])
+                if data.get("date") == heute:
+                    return data
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        alle_tasks = fetch_entries(conn, user["user_id"], "task", limit=300)
+        heutige_tasks = [
+            t for t in alle_tasks
+            if t.get("due_date") == heute and t.get("status", "open") == "open"
+        ]
+        if not heutige_tasks:
+            return None
+
+        memory = build_memory_context(conn, user["user_id"])
+        aufgaben_liste = "\n".join(f"- {t['content']}" for t in heutige_tasks)
+        kontext = f"{memory}\n\n--- Offene Aufgaben für heute ---\n{aufgaben_liste}"
+
+        raw = await call_claude(DAILY_FOCUS_SYSTEM_PROMPT, [{"role": "user", "content": kontext}])
+        try:
+            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            parsed = json.loads(cleaned)
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
+        passende_task = next((t for t in heutige_tasks if t["content"] == parsed.get("task_text")), None)
+
+        result = {
+            "date": heute,
+            "headline": parsed.get("headline", ""),
+            "reasoning": parsed.get("reasoning", ""),
+            "taskId": passende_task["id"] if passende_task else None,
+            "accepted": None,
+        }
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'daily_focus', ?, FALSE, ?)",
+            (user["user_id"], json.dumps(result, ensure_ascii=False), now_iso()),
+        )
+        return result
 
 
 WEEKLY_REVIEW_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person hat um einen Wochenrückblick \
