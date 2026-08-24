@@ -121,6 +121,7 @@ if USE_POSTGRES:
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS sole_priority INTEGER")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS priority_reason TEXT")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual'")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS completed_at TEXT")
 
     def run_query(conn, query: str, params: tuple = ()):
         """Führt eine Query aus und gibt eine Liste von dicts zurück (SELECT)."""
@@ -191,7 +192,7 @@ else:
                 # bestehende Spalten bleiben für das alte Frontend unverändert.
                 "status TEXT DEFAULT 'open'", "deadline TEXT", "estimated_minutes INTEGER",
                 "venture_id INTEGER", "milestone_text TEXT", "sole_priority INTEGER",
-                "priority_reason TEXT", "source TEXT DEFAULT 'manual'",
+                "priority_reason TEXT", "source TEXT DEFAULT 'manual'", "completed_at TEXT",
             ]:
                 try:
                     conn.execute(f"ALTER TABLE entries ADD COLUMN {col_def}")
@@ -246,6 +247,11 @@ class EntryUpdate(BaseModel):
 class ChatIn(BaseModel):
     message: str
     mode: Optional[str] = None  # "onboarding" erzwingt das Kennenlern-Gespräch
+    # V1-Erweiterung: wenn True, werden erkannte Aufgaben/Notizen/Standbein-
+    # Updates NICHT automatisch gespeichert, sondern als "vorschlaege"
+    # zurückgegeben — das alte Frontend sendet dieses Feld nicht und behält
+    # das bisherige Auto-Speichern-Verhalten unverändert bei.
+    confirm_mode: bool = False
 
 
 class GoalIn(BaseModel):
@@ -495,9 +501,22 @@ Fragen oder ein Gespräch ohne konkrete To-dos: leeres Aufgaben-Array, das ist n
 2. STRATEGISCHES SPARRING: Das ist deine wichtigste Rolle, nicht nur Nebensache:
 - Du bist primär STRATEGISCH, nicht operativ. Die Frage "was steht heute an" beantwortet die \
 Aufgaben-Extraktion oben bereits - deine eigentliche Stärke ist "was ist eigentlich wichtig, und warum".
+- WICHTIGSTER GRUNDSATZ: Sole empfiehlt, die Person entscheidet - aber du bist kein neutraler \
+Assistent. Wenn genug Kontext vorhanden ist, hast du eine klare Meinung. Nicht "Hier sind fünf \
+Optionen", sondern "Ich würde A wählen" - mit einer kurzen Begründung danach. Wenn dir Kontext \
+fehlt, um eine echte Empfehlung zu geben, sag das ehrlich und frag gezielt nach, statt eine \
+Antwort zu erfinden oder auszuweichen.
+- Du darfst respektvoll widersprechen. Nicht "Du vermeidest Akquise", sondern eher "Ich frage \
+mich, ob die Website gerade zur sicheren Alternative zur Akquise wird" - challenge die Annahme, \
+nicht die Person.
+- Antworten sind standardmässig KURZ - deutlich kürzer als typische Chat-Antworten. Nicht "Hier \
+sind sieben Punkte", sondern 2-4 knappe Sätze mit einer klaren Haltung. Lange Erklärungen nur, \
+wenn die Empfehlung wirklich ungewöhnlich, überraschend oder wichtig ist - dann kurz begründen, \
+nicht bei jeder Kleinigkeit.
+- Keine künstlichen Sicherheits-Angaben ("Konfidenz: 78%") - Unsicherheit natürlich in Worten \
+ausdrücken ("Ich tendiere zu A, aber mir fehlt noch, wie potenzielle Kunden reagieren").
 - Wenn die Person Anzeichen zeigt, mehrere Dinge gleichzeitig anzufangen oder sich zu verzetteln, \
-sprich das direkt und freundlich an - hilf, einen Fokus zu finden, statt jede neue Idee unterstützend \
-zu bestätigen.
+sprich das direkt an - hilf, einen Fokus zu finden, statt jede neue Idee unterstützend zu bestätigen.
 - Wenn die Person sehr euphorisch über eine neue Idee klingt, darfst du diese Euphorie sanft erden, \
 mit einer ehrlichen, wohlwollenden Nachfrage - nicht bremsen um des Bremsens willen, sondern um echte \
 Reflexion statt reinem Enthusiasmus anzuregen.
@@ -528,7 +547,11 @@ bleibt "standbein_update" leer/null - nur eintragen, wenn wirklich neue, strateg
 Standbein-Information genannt wurde.
 
 Weitere Regeln:
-- Antworte warm, aber sachlich - keine übertriebene Cheerleader-Sprache.
+- Antworte ruhig, präzise, direkt - keine übertriebene Cheerleader-Sprache, keine generischen \
+Komplimente ("Das ist eine tolle Idee!"), keine künstliche Motivation ("Du schaffst das!", \
+"Lass uns das rocken 🚀"). Positive Beobachtungen sind erlaubt, aber nur konkret und \
+evidenzbasiert - nicht "Du bist sehr kreativ", sondern z.B. "In mehreren Entscheidungen \
+entwickelst du schnell plausible Optionen - schwieriger scheint eher die Auswahl zu sein."
 - Kurz und konkret, auf Deutsch.
 - Bei RAV/AHV/Steuerfragen: allgemeine Informationen ja, aber keine verbindliche Rechts- oder \
 Steuerberatung. Bei unklaren Einzelfällen auf RAV/Ausgleichskasse/Treuhänder verweisen.
@@ -787,21 +810,25 @@ def update_entry(entry_id: int, update: EntryUpdate, user: dict = Depends(get_cu
     with get_db() as conn:
         # done <-> status bleiben synchron, damit altes und neues Frontend
         # dieselbe Wahrheit sehen, egal welches von beiden gesendet hat.
+        # completed_at wird gesetzt, sobald etwas als erledigt markiert wird -
+        # für den Weekly Review ("was wurde diese Woche bewegt").
         if update.status is not None:
             derived_done = update.status == "done"
+            completed_at = now_iso() if derived_done else None
             run_write(
                 conn,
-                "UPDATE entries SET status = ?, done = ? WHERE id = ? AND user_id = ?",
-                (update.status, derived_done, entry_id, user["user_id"]),
+                "UPDATE entries SET status = ?, done = ?, completed_at = ? WHERE id = ? AND user_id = ?",
+                (update.status, derived_done, completed_at, entry_id, user["user_id"]),
             )
         elif update.done is not None:
             # Altes Frontend kennt nur true/false: true -> "done",
             # false -> "open" (kann kein "not-relevant" ausdrücken).
             derived_status = "done" if update.done else "open"
+            completed_at = now_iso() if update.done else None
             run_write(
                 conn,
-                "UPDATE entries SET done = ?, status = ? WHERE id = ? AND user_id = ?",
-                (update.done, derived_status, entry_id, user["user_id"]),
+                "UPDATE entries SET done = ?, status = ?, completed_at = ? WHERE id = ? AND user_id = ?",
+                (update.done, derived_status, completed_at, entry_id, user["user_id"]),
             )
         if update.content is not None:
             run_write(
@@ -984,6 +1011,97 @@ async def chat_start(payload: ChatStartIn, user: dict = Depends(get_current_user
     return {"answer": antwort}
 
 
+def create_task_entry(conn, user_id: int, inhalt: str, faellig_label: Optional[str]) -> None:
+    due = due_date_from_label(faellig_label)
+    run_write(
+        conn,
+        "INSERT INTO entries (user_id, type, content, done, due_date, created_at) VALUES (?, 'task', ?, FALSE, ?, ?)",
+        (user_id, inhalt, due, now_iso()),
+    )
+
+
+def create_notiz_entry(conn, user_id: int, text: str) -> None:
+    run_write(
+        conn,
+        "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'mentor_notiz', ?, FALSE, ?)",
+        (user_id, text.strip(), now_iso()),
+    )
+
+
+def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
+    """Legt ein neues Standbein an oder merged in ein bestehendes (nach Name).
+    Enthält dieselbe Logik, die vorher inline in /chat stand — jetzt auch von
+    /suggestions/confirm wiederverwendbar."""
+    import json
+
+    if not (isinstance(standbein_update, dict) and standbein_update.get("name")):
+        return False
+
+    neuer_name = standbein_update["name"].strip().lower()
+    bestehende_ventures = fetch_entries(conn, user_id, "venture", limit=50)
+    passendes_venture = None
+    for v in bestehende_ventures:
+        try:
+            v_data = json.loads(v["content"])
+            if v_data.get("name", "").strip().lower() == neuer_name:
+                passendes_venture = (v["id"], v_data)
+                break
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    neue_meilensteine = standbein_update.get("meilensteine", []) or []
+
+    if passendes_venture:
+        venture_id, v_data = passendes_venture
+        if standbein_update.get("vision"):
+            v_data["vision"] = standbein_update["vision"]
+        if standbein_update.get("phase") in VENTURE_PHASES:
+            v_data["phase"] = standbein_update["phase"]
+        elif v_data.get("phase") not in VENTURE_PHASES:
+            v_data["phase"] = "idee"
+        bestehende_meilensteine = normalize_meilensteine(v_data.get("meilensteine"))
+        bestehende_texte = {m.get("text", "").strip().lower() for m in bestehende_meilensteine}
+        for m in neue_meilensteine:
+            if isinstance(m, dict) and m.get("text", "").strip().lower() not in bestehende_texte:
+                bestehende_meilensteine.append({
+                    "text": m.get("text", ""),
+                    "datum": m.get("datum"),
+                    "erledigt": False,
+                    "messgroesse": m.get("messgroesse", ""),
+                })
+        v_data["meilensteine"] = bestehende_meilensteine
+        v_data["umsatz"] = normalize_umsatz(v_data.get("umsatz"))
+        run_write(
+            conn,
+            "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
+            (json.dumps(v_data, ensure_ascii=False), venture_id, user_id),
+        )
+    else:
+        neues_venture = {
+            "name": standbein_update["name"],
+            "vision": standbein_update.get("vision", ""),
+            "phase": standbein_update.get("phase") if standbein_update.get("phase") in VENTURE_PHASES else "idee",
+            "role": standbein_update.get("role", ""),
+            "focus": standbein_update.get("focus") if standbein_update.get("focus") in VENTURE_FOCUS_OPTIONS else "secondary",
+            "umsatz": [],
+            "meilensteine": [
+                {
+                    "text": m.get("text", ""),
+                    "datum": m.get("datum"),
+                    "erledigt": False,
+                    "messgroesse": m.get("messgroesse", ""),
+                }
+                for m in neue_meilensteine if isinstance(m, dict)
+            ],
+        }
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'venture', ?, FALSE, ?)",
+            (user_id, json.dumps(neues_venture, ensure_ascii=False), now_iso()),
+        )
+    return True
+
+
 @app.post("/chat")
 async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     import json
@@ -1047,98 +1165,56 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
             "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_assistant', ?, FALSE, ?)",
             (user["user_id"], antwort, now_iso()),
         )
-        erstellte_aufgaben = []
-        for aufgabe in neue_aufgaben:
-            inhalt = aufgabe.get("inhalt", "") if isinstance(aufgabe, dict) else str(aufgabe)
-            faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
-            if not inhalt:
-                continue
-            due = due_date_from_label(faellig_label)
-            run_write(
-                conn,
-                "INSERT INTO entries (user_id, type, content, done, due_date, created_at) VALUES (?, 'task', ?, FALSE, ?, ?)",
-                (user["user_id"], inhalt, due, now_iso()),
-            )
-            erstellte_aufgaben.append(inhalt)
 
+        erstellte_aufgaben = []
         profil_gespeichert = False
+        standbein_gespeichert = False
+        vorschlaege = []  # nur befüllt, wenn confirm_mode=True
+
+        # Profil aus dem Onboarding-Gespräch: hat schon eine eigene explizite
+        # Bestätigung DURCH DAS GESPRÄCH SELBST ("Hab ich das richtig
+        # verstanden?") bevor das JSON überhaupt ausgefüllt zurückkommt -
+        # zählt als bereits bestätigt, wird unabhängig von confirm_mode
+        # direkt gespeichert (Briefing: "Explizit im Onboarding angegebene
+        # Informationen dürfen direkt gespeichert werden").
         if isinstance(neues_profil, dict) and neues_profil:
             save_profile_merged(conn, user["user_id"], neues_profil)
             profil_gespeichert = True
 
-        if isinstance(notiz_update, str) and notiz_update.strip():
-            run_write(
-                conn,
-                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'mentor_notiz', ?, FALSE, ?)",
-                (user["user_id"], notiz_update.strip(), now_iso()),
-            )
-
-        standbein_gespeichert = False
-        if isinstance(standbein_update, dict) and standbein_update.get("name"):
-            neuer_name = standbein_update["name"].strip().lower()
-            bestehende_ventures = fetch_entries(conn, user["user_id"], "venture", limit=50)
-            passendes_venture = None
-            for v in bestehende_ventures:
-                try:
-                    v_data = json.loads(v["content"])
-                    if v_data.get("name", "").strip().lower() == neuer_name:
-                        passendes_venture = (v["id"], v_data)
-                        break
-                except (json.JSONDecodeError, TypeError):
+        if payload.confirm_mode:
+            # Neues Verhalten: nichts automatisch speichern, nur vorschlagen.
+            for aufgabe in neue_aufgaben:
+                inhalt = aufgabe.get("inhalt", "") if isinstance(aufgabe, dict) else str(aufgabe)
+                faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
+                if not inhalt:
                     continue
+                vorschlaege.append({"kind": "task", "label": inhalt, "payload": {"inhalt": inhalt, "faellig": faellig_label}})
 
-            neue_meilensteine = standbein_update.get("meilensteine", []) or []
+            if isinstance(notiz_update, str) and notiz_update.strip():
+                text = notiz_update.strip()
+                vorschlaege.append({"kind": "notiz", "label": text, "payload": {"text": text}})
 
-            if passendes_venture:
-                # Bestehendes Standbein: Vision aktualisieren (falls neu genannt),
-                # neue Meilensteine ergänzen, bestehende NICHT verlieren.
-                venture_id, v_data = passendes_venture
-                if standbein_update.get("vision"):
-                    v_data["vision"] = standbein_update["vision"]
-                if standbein_update.get("phase") in VENTURE_PHASES:
-                    v_data["phase"] = standbein_update["phase"]
-                elif v_data.get("phase") not in VENTURE_PHASES:
-                    v_data["phase"] = "idee"
-                bestehende_meilensteine = normalize_meilensteine(v_data.get("meilensteine"))
-                bestehende_texte = {m.get("text", "").strip().lower() for m in bestehende_meilensteine}
-                for m in neue_meilensteine:
-                    if isinstance(m, dict) and m.get("text", "").strip().lower() not in bestehende_texte:
-                        bestehende_meilensteine.append({
-                            "text": m.get("text", ""),
-                            "datum": m.get("datum"),
-                            "erledigt": False,
-                            "messgroesse": m.get("messgroesse", ""),
-                        })
-                v_data["meilensteine"] = bestehende_meilensteine
-                v_data["umsatz"] = normalize_umsatz(v_data.get("umsatz"))
-                run_write(
-                    conn,
-                    "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
-                    (json.dumps(v_data, ensure_ascii=False), venture_id, user["user_id"]),
-                )
-            else:
-                # Neues Standbein anlegen
-                neues_venture = {
-                    "name": standbein_update["name"],
-                    "vision": standbein_update.get("vision", ""),
-                    "phase": standbein_update.get("phase") if standbein_update.get("phase") in VENTURE_PHASES else "idee",
-                    "umsatz": [],
-                    "meilensteine": [
-                        {
-                            "text": m.get("text", ""),
-                            "datum": m.get("datum"),
-                            "erledigt": False,
-                            "messgroesse": m.get("messgroesse", ""),
-                        }
-                        for m in neue_meilensteine if isinstance(m, dict)
-                    ],
-                }
-                run_write(
-                    conn,
-                    "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'venture', ?, FALSE, ?)",
-                    (user["user_id"], json.dumps(neues_venture, ensure_ascii=False), now_iso()),
-                )
-            standbein_gespeichert = True
+            if isinstance(standbein_update, dict) and standbein_update.get("name"):
+                vorschlaege.append({
+                    "kind": "standbein",
+                    "label": f"Standbein: {standbein_update['name']}",
+                    "payload": standbein_update,
+                })
+        else:
+            # Altes Verhalten, unverändert für das bestehende Frontend:
+            # sofort automatisch speichern.
+            for aufgabe in neue_aufgaben:
+                inhalt = aufgabe.get("inhalt", "") if isinstance(aufgabe, dict) else str(aufgabe)
+                faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
+                if not inhalt:
+                    continue
+                create_task_entry(conn, user["user_id"], inhalt, faellig_label)
+                erstellte_aufgaben.append(inhalt)
+
+            if isinstance(notiz_update, str) and notiz_update.strip():
+                create_notiz_entry(conn, user["user_id"], notiz_update)
+
+            standbein_gespeichert = apply_standbein_update(conn, user["user_id"], standbein_update)
 
     return {
         "answer": antwort,
@@ -1146,7 +1222,30 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         "onboarding": (not has_profile) or (payload.mode == "onboarding"),
         "profil_gespeichert": profil_gespeichert,
         "standbein_gespeichert": standbein_gespeichert,
+        "vorschlaege": vorschlaege,
     }
+
+
+class SuggestionConfirmIn(BaseModel):
+    kind: str  # "task" | "notiz" | "standbein"
+    payload: dict
+
+
+@app.post("/suggestions/confirm")
+def confirm_suggestion(body: SuggestionConfirmIn, user: dict = Depends(get_current_user)):
+    """Wendet einen einzelnen, vom User bestätigten Sole-Vorschlag an.
+    Wird vom neuen Frontend aufgerufen, wenn auf 'Merken'/'Diese Woche'/
+    'Übernehmen' o.ä. geklickt wird."""
+    with get_db() as conn:
+        if body.kind == "task":
+            create_task_entry(conn, user["user_id"], body.payload.get("inhalt", ""), body.payload.get("faellig"))
+        elif body.kind == "notiz":
+            create_notiz_entry(conn, user["user_id"], body.payload.get("text", ""))
+        elif body.kind == "standbein":
+            apply_standbein_update(conn, user["user_id"], body.payload)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unbekannte Vorschlagsart: {body.kind}")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1242,6 +1341,86 @@ async def generate_reflection(user: dict = Depends(get_current_user)):
         )
 
     return {"text": text.strip()}
+
+
+WEEKLY_REVIEW_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person hat um einen Wochenrückblick \
+gebeten. Du bekommst unten eine Liste, was diese Woche erledigt wurde, was liegen geblieben ist, und \
+den aktuellen Stand ihrer Standbeine.
+
+Schreib NUR den Abschnitt "Was jetzt zählt" - eine kurze, klare Empfehlung (2-4 Sätze) für die \
+kommende Woche, mit Haltung, nicht als neutrale Liste. Nicht "Du könntest X oder Y tun", sondern \
+"Für nächste Woche würde ich einen Schwerpunkt setzen: ...". Beziehe dich konkret auf das, was \
+liegen geblieben ist oder was der aktuelle Meilenstein-Fokus nahelegt - keine generischen Ratschläge. \
+Falls zu wenig bewegt wurde, um daraus etwas Sinnvolles abzuleiten, sag das ehrlich, statt eine \
+Empfehlung zu erfinden. Auf Deutsch. Antworte NUR mit dem Text, ohne Anführungszeichen, ohne \
+Überschrift."""
+
+
+@app.post("/weekly-review/generate")
+async def generate_weekly_review(user: dict = Depends(get_current_user)):
+    """Nur auf Anfrage, nie automatisch. GEMACHT/NICHT BEWEGT/GELERNT/COMPASS sind
+    echte, direkt abgefragte Daten - nur 'was_jetzt_zaehlt' kommt von Claude, als
+    gezielte Synthese, nicht als erfundener Text."""
+    import json
+
+    sieben_tage_alt = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
+    with get_db() as conn:
+        alle_tasks = fetch_entries(conn, user["user_id"], "task", limit=300)
+        alle_notizen = fetch_entries(conn, user["user_id"], "mentor_notiz", limit=50)
+        alle_ventures = fetch_entries(conn, user["user_id"], "venture", limit=20)
+
+    gemacht = [
+        t["content"] for t in alle_tasks
+        if t.get("completed_at") and t["completed_at"] >= sieben_tage_alt
+    ]
+    heute = datetime.now(timezone.utc).date().isoformat()
+    sieben_tage_alt_datum = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+    nicht_bewegt = [
+        t["content"] for t in alle_tasks
+        if t.get("status", "open") == "open"
+        and t.get("due_date") and sieben_tage_alt_datum <= t["due_date"] < heute
+    ]
+    gelernt = [
+        n["content"] for n in alle_notizen
+        if n["created_at"] >= sieben_tage_alt
+    ]
+
+    compass_stand = []
+    for v in alle_ventures:
+        try:
+            v_data = json.loads(v["content"])
+            compass_stand.append({
+                "name": v_data.get("name", ""),
+                "phase": v_data.get("phase", "idee"),
+                "focus": v_data.get("focus", "secondary"),
+            })
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    kontext_teile = []
+    if gemacht:
+        kontext_teile.append("Diese Woche erledigt: " + "; ".join(gemacht))
+    if nicht_bewegt:
+        kontext_teile.append("Liegen geblieben (war für diese Woche geplant): " + "; ".join(nicht_bewegt))
+    if compass_stand:
+        kontext_teile.append(
+            "Aktueller Compass-Stand: "
+            + "; ".join(f"{v['name']} ({v['phase']}, {v['focus']})" for v in compass_stand)
+        )
+    kontext = "\n".join(kontext_teile) if kontext_teile else "Diese Woche wenig Aktivität erfasst."
+
+    was_jetzt_zaehlt = await call_claude(
+        WEEKLY_REVIEW_SYSTEM_PROMPT, [{"role": "user", "content": kontext}]
+    )
+
+    return {
+        "gemacht": gemacht,
+        "nicht_bewegt": nicht_bewegt,
+        "gelernt": gelernt,
+        "compass_stand": compass_stand,
+        "was_jetzt_zaehlt": was_jetzt_zaehlt.strip(),
+    }
 
 
 # ---------------------------------------------------------------------------
