@@ -913,6 +913,18 @@ def clear_chat_history(user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
+@app.delete("/account/reset")
+def reset_account_data(user: dict = Depends(get_current_user)):
+    """Löscht ALLE Daten des Accounts (Aufgaben, Standbeine, Profil, Notizen,
+    Chat, lose Gedanken, Portfolio-Dokument) — der Login/Account selbst bleibt
+    bestehen, damit man sofort wieder von vorne testen kann, ohne erneute
+    Freischaltung. Kein Zurück, deshalb bewusst ein eigener, klar benannter
+    Endpoint statt eines generischen 'delete everything'-Parameters irgendwo."""
+    with get_db() as conn:
+        run_write(conn, "DELETE FROM entries WHERE user_id = ?", (user["user_id"],))
+    return {"ok": True}
+
+
 def save_profile_merged(conn, user_id: int, updates: dict) -> dict:
     """Führt ein (evtl. unvollständiges) Profil-Update mit dem bisherigen Profil zusammen,
     statt es zu überschreiben — damit spätere Ergänzungen (z.B. nur 'Stärken' aus einem
