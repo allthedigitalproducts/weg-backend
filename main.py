@@ -2155,27 +2155,35 @@ async def generate_reflection(user: dict = Depends(get_current_user)):
 DAILY_FOCUS_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person öffnet gerade ihre Übersicht \
 und braucht eine klare, begründete Einschätzung: worauf sollte sie sich HEUTE konzentrieren?
 
-Du bekommst unten den bekannten Kontext (Profil, Vision, Standbeine, Meilensteine) sowie die \
-offenen Aufgaben für heute. Antworte NUR als JSON, ohne zusätzlichen Text:
+Du bekommst unten den bekannten Kontext (Profil, Vision, Standbeine mit Priorität/Phase/aktuellem \
+Test/aktuellem Stand) sowie alle offenen Aufgaben. Antworte NUR als JSON, ohne zusätzlichen Text:
 {
-  "headline": "kurzer, klarer Satz mit Haltung, z.B. 'Heute würde ich auf Akquise setzen.'",
-  "reasoning": "1-3 Sätze Begründung, warum genau das gerade zählt - konkret, nicht generisch",
-  "task_text": "EXAKT der Titel einer der unten aufgeführten offenen Aufgaben für heute, die am besten zu deiner Empfehlung passt, oder null falls keine passt oder keine Aufgaben vorhanden sind"
+  "headline": "kurzer, klarer Satz mit Haltung, z.B. 'Heute würde ich Consulting vorziehen.'",
+  "reasoning": "1-3 Sätze Begründung, warum genau das gerade zählt - konkret, nicht generisch. Hebe die wichtigste Kernaussage mit **doppelten Sternchen** hervor, z.B. 'Dein nächster Meilenstein ist der **erste zahlende Kunde**.'",
+  "task_text": "EXAKT der Titel einer der unten aufgeführten offenen Aufgaben, die am besten zu deiner Empfehlung passt, oder null falls keine passt"
 }
 
-Wichtig: "task_text" muss EXAKT (Zeichen für Zeichen) einem der unten aufgeführten Aufgaben-Titel \
-entsprechen, sonst null - erfinde keinen Titel. Falls der Kontext zu dünn ist, um eine echte, \
-begründete Empfehlung abzugeben (z.B. kaum Aufgaben, keine erkennbare Priorität), sag das ehrlich \
-in "headline" statt eine beliebige Aufgabe hervorzuheben - z.B. "headline": "Bevor ich dir etwas \
-empfehle:" und "reasoning": eine gezielte Rückfrage statt einer Begründung."""
+WICHTIG - GIB IMMER EINE ECHTE EMPFEHLUNG, KEINE RÜCKFRAGE: Nutze die Kette Compass (welches \
+Standbein hat gerade Priorität) → Standbein (welcher Test/aktueller Stand) → Aufgaben, um eine \
+konkrete Einschätzung zu bilden - auch wenn keine Aufgabe exakt für heute fällig ist. Wenn es offene \
+Aufgaben gibt, die zum Primary-Standbein oder dessen aktuellem Test gehören, empfiehl eine davon, \
+auch wenn sie für später geplant war. Eine Rückfrage statt einer Empfehlung ist NUR die absolute \
+Ausnahme, wenn wirklich gar keine offenen Aufgaben existieren UND keine Standbein-Priorität erkennbar \
+ist - dann "headline": "Bevor ich dir etwas empfehle:" und "reasoning": eine gezielte Rückfrage. In \
+allen anderen Fällen: eine echte, begründete Empfehlung, so wie ein Mentor sie am Morgen geben würde.
+
+"task_text" muss EXAKT (Zeichen für Zeichen) einem der unten aufgeführten Aufgaben-Titel entsprechen, \
+sonst null - erfinde keinen Titel."""
 
 
 @app.get("/dashboard/focus")
 async def get_daily_focus(user: dict = Depends(get_current_user)):
     """Liefert den strategischen Tages-Fokus — einmal pro Tag generiert, danach aus der DB
     wiederverwendet (kein neuer KI-Aufruf bei jedem Übersichts-Aufruf). Gibt None zurück, wenn
-    gar keine offenen Aufgaben für heute existieren - dann zeigt das Frontend den vorgesehenen
-    Leerzustand, statt etwas zu erfinden."""
+    WIRKLICH gar keine offenen Aufgaben existieren (nicht nur keine für heute) - dann zeigt das
+    Frontend den vorgesehenen Leerzustand. Nutzt bewusst ALLE offenen Aufgaben als Grundlage, nicht
+    nur die exakt für heute fälligen - sonst hätte Sole an den meisten Tagen nichts zu empfehlen und
+    würde auf die unerwünschte Rückfrage ausweichen müssen."""
     import json
 
     heute = datetime.now(timezone.utc).date().isoformat()
@@ -2191,16 +2199,22 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
                 continue
 
         alle_tasks = fetch_entries(conn, user["user_id"], "task", limit=300)
-        heutige_tasks = [
-            t for t in alle_tasks
-            if t.get("due_date") == heute and t.get("status", "open") == "open"
-        ]
-        if not heutige_tasks:
+        offene_tasks = [t for t in alle_tasks if t.get("status", "open") == "open"]
+        if not offene_tasks:
             return None
 
+        # Heutige/überfällige Aufgaben zuerst in der Liste, damit sie bei
+        # gleichwertiger strategischer Relevanz bevorzugt werden - aber alle
+        # offenen Aufgaben bleiben sichtbar, damit Sole nicht auf eine
+        # zufällig leere "heute"-Liste stösst.
+        offene_tasks.sort(key=lambda t: (t.get("due_date") or "9999", ))
+
         memory = build_memory_context(conn, user["user_id"])
-        aufgaben_liste = "\n".join(f"- {t['content']}" for t in heutige_tasks)
-        kontext = f"{memory}\n\n--- Offene Aufgaben für heute ---\n{aufgaben_liste}"
+        aufgaben_liste = "\n".join(
+            f"- {t['content']}" + (f" (fällig: {t['due_date']})" if t.get("due_date") else " (kein Datum gesetzt)")
+            for t in offene_tasks
+        )
+        kontext = f"{memory}\n\n--- Alle offenen Aufgaben ---\n{aufgaben_liste}"
 
         raw = await call_claude(DAILY_FOCUS_SYSTEM_PROMPT, [{"role": "user", "content": kontext}])
         try:
@@ -2208,7 +2222,7 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
         except (json.JSONDecodeError, AttributeError):
             return None
 
-        passende_task = next((t for t in heutige_tasks if t["content"] == parsed.get("task_text")), None)
+        passende_task = next((t for t in offene_tasks if t["content"] == parsed.get("task_text")), None)
 
         result = {
             "date": heute,
