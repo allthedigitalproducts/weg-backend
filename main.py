@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import sqlite3
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -37,6 +38,16 @@ import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Strukturiertes Logging mit Fehler-Kategorien (AI_TIMEOUT, DB_READ_FAILED, etc.)
+# statt alles unter einer generischen "nicht erreichbar"-Meldung zu verstecken.
+# Landet in den Render-Logs, ohne sensible Inhalte (Nachrichtentext etc.) zu loggen.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("sole")
+
+
+def log_error(category: str, detail: str, user_id: int | None = None) -> None:
+    logger.error(f"[{category}] user={user_id} — {detail}")
 
 DB_PATH = os.environ.get("WEG_DB_PATH", "weg.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -281,6 +292,37 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+WOCHENTAGE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+MONATSNAMEN = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"]
+
+
+def build_messages_with_date_markers(previous_turns: list) -> list:
+    """Baut die messages-Liste für die Anthropic API und setzt an jedem
+    Tageswechsel einen kurzen Datums-Hinweis vor die erste Nachricht dieses
+    Tages. Ohne das hat Claude keine Möglichkeit zu wissen, welche früheren
+    Nachrichten von heute und welche von einem anderen Tag waren - die
+    einzelnen Einträge selbst tragen sonst kein Datum, nur der System-Prompt
+    kennt das HEUTIGE Datum, nicht das der einzelnen Verlaufs-Nachrichten."""
+    messages = []
+    letztes_datum = None
+    for t in previous_turns:
+        created_at = t.get("created_at") or ""
+        entry_datum = created_at[:10] if len(created_at) >= 10 else None
+        content = t["content"]
+
+        if entry_datum and entry_datum != letztes_datum:
+            try:
+                d = datetime.fromisoformat(entry_datum)
+                label = f"[{d.day}. {MONATSNAMEN[d.month - 1]} {d.year}, {WOCHENTAGE[d.weekday()]}]\n"
+            except ValueError:
+                label = f"[{entry_datum}]\n"
+            content = label + content
+            letztes_datum = entry_datum
+
+        messages.append({"role": "user" if t["type"] == "chat_user" else "assistant", "content": content})
+    return messages
+
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
@@ -351,6 +393,8 @@ def build_memory_context(conn, user_id: int) -> str:
     overall_vision = fetch_entries(conn, user_id, "overall_vision", limit=1)
     ventures_raw = fetch_entries(conn, user_id, "venture", limit=20)
     mentor_notizen = fetch_entries(conn, user_id, "mentor_notiz", limit=30)
+    hypotheses_raw = fetch_entries(conn, user_id, "hypothesis", limit=15)
+    decisions_raw = fetch_entries(conn, user_id, "decision", limit=15)
 
     parts = []
     if profile:
@@ -405,6 +449,41 @@ def build_memory_context(conn, user_id: int) -> str:
                 continue
         if venture_lines:
             parts.append("Standbeine/Geschäftsfelder der Person:\n" + "\n".join(venture_lines))
+
+    if hypotheses_raw:
+        hyp_lines = []
+        for h in hypotheses_raw:
+            try:
+                data = json.loads(h["content"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            status = data.get("status", "aktiv")
+            if status == "widerlegt":
+                continue  # widerlegte Hypothesen nicht weiter als aktive Annahme mitschleppen
+            line = f"- [{status}] {data.get('text', '')}"
+            if data.get("standbein_name"):
+                line += f" (betrifft: {data['standbein_name']})"
+            hyp_lines.append(line)
+        if hyp_lines:
+            parts.append(
+                "Bisherige Hypothesen (Annahmen, keine bestätigten Fakten - du darfst sie "
+                "anpassen, wenn neue Informationen dagegen sprechen):\n" + "\n".join(hyp_lines)
+            )
+
+    if decisions_raw:
+        dec_lines = []
+        for d in decisions_raw:
+            try:
+                data = json.loads(d["content"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            line = f"- {data.get('text', '')} ({d['created_at'][:10]})"
+            dec_lines.append(line)
+        if dec_lines:
+            parts.append(
+                "Bereits getroffene Entscheidungen der Person (respektiere diese, bis die "
+                "Person selbst etwas anderes entscheidet):\n" + "\n".join(dec_lines)
+            )
     if tasks:
         offen = [t for t in tasks if not t["done"]]
         erledigt = [t for t in tasks if t["done"]]
@@ -425,17 +504,16 @@ async def call_claude(system_prompt: str, messages: list[dict]) -> str:
     bisherige Unterhaltung inkl. der neuesten Nachricht. Das ist wichtig, damit Claude
     sich innerhalb EINES Gesprächs an bereits Gesagtes erinnert (z.B. beim Onboarding-
     Gespräch, wo mehrere Fragen nacheinander gestellt werden).
+
+    Bis zu zwei Versuche insgesamt - deckt sowohl Netzwerk-/Timeout-Fehler beim Aufruf
+    SELBST als auch eine unerwartete/fehlerhafte Antwortstruktur ab (beides wurde vorher
+    unterschiedlich robust behandelt - jetzt einheitlich, mit kategorisiertem Logging
+    statt einer generischen "nicht erreichbar"-Meldung ohne Diagnose-Möglichkeit).
     """
     if not ANTHROPIC_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="ANTHROPIC_API_KEY ist nicht gesetzt. Siehe README.md.",
-        )
+        log_error("AI_CONFIG_MISSING", "ANTHROPIC_API_KEY ist nicht gesetzt")
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY ist nicht gesetzt. Siehe README.md.")
 
-    # Bis zu zwei Versuche: bei langen Gesprächen (viel Kontext = mehr
-    # Verarbeitungszeit) kommt es gelegentlich zu einem Timeout oder einem
-    # kurzen Netzwerk-Hänger bei Anthropic selbst - ein zweiter Versuch löst
-    # das meistens, ohne dass die Person "Sole ist nicht erreichbar" sieht.
     letzter_fehler = None
     for versuch in range(2):
         try:
@@ -449,24 +527,49 @@ async def call_claude(system_prompt: str, messages: list[dict]) -> str:
                     },
                     json={
                         "model": ANTHROPIC_MODEL,
-                        "max_tokens": 1000,
+                        "max_tokens": 2500,
                         "system": system_prompt,
                         "messages": messages,
                     },
                 )
-            if response.status_code == 200:
-                break
-            letzter_fehler = HTTPException(status_code=502, detail=f"Anthropic API Fehler: {response.text}")
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+        except httpx.RequestError as exc:
+            # Deckt ALLE httpx-Transportfehler ab (Timeout, Connect, Read, Write,
+            # Protocol, DNS...) - vorher wurden nur drei spezifische Unterklassen
+            # gefangen, alles andere lief unbehandelt durch.
+            kategorie = "AI_TIMEOUT" if isinstance(exc, httpx.TimeoutException) else "AI_CONNECTION_ERROR"
+            log_error(kategorie, f"Versuch {versuch + 1}/2: {exc}")
             letzter_fehler = HTTPException(status_code=503, detail=f"Anthropic API nicht erreichbar: {exc}")
             continue
-    else:
-        # Beide Versuche fehlgeschlagen
-        raise letzter_fehler
 
-    data = response.json()
-    text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
-    return "\n".join(text_blocks) if text_blocks else "(keine Antwort erhalten)"
+        if response.status_code == 429:
+            log_error("AI_RATE_LIMIT", f"Versuch {versuch + 1}/2: {response.text[:300]}")
+            letzter_fehler = HTTPException(status_code=503, detail="Anthropic API Rate Limit erreicht.")
+            continue
+        if response.status_code != 200:
+            log_error("AI_BAD_STATUS", f"Versuch {versuch + 1}/2: Status {response.status_code}: {response.text[:300]}")
+            letzter_fehler = HTTPException(status_code=502, detail=f"Anthropic API Fehler ({response.status_code})")
+            continue
+
+        # Response-Parsing war vorher AUSSERHALB jeder Fehlerbehandlung - ein
+        # unerwartetes/unvollständiges 200er-Response-Format hätte den ganzen
+        # Request unbehandelt abstürzen lassen, statt einen zweiten Versuch
+        # oder eine saubere Fehlermeldung auszulösen.
+        try:
+            data = response.json()
+            text_blocks = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+        except (ValueError, KeyError, AttributeError) as exc:
+            log_error("AI_INVALID_RESPONSE", f"Versuch {versuch + 1}/2: {exc}")
+            letzter_fehler = HTTPException(status_code=502, detail="Anthropic-Antwort war nicht auswertbar.")
+            continue
+
+        if not text_blocks:
+            log_error("AI_EMPTY_RESPONSE", f"Versuch {versuch + 1}/2: kein Text-Block in der Antwort")
+            letzter_fehler = HTTPException(status_code=502, detail="Anthropic-Antwort enthielt keinen Text.")
+            continue
+
+        return "\n".join(text_blocks)
+
+    raise letzter_fehler
 
 
 async def send_email(to: str, subject: str, html_body: str) -> bool:
@@ -584,6 +687,13 @@ ihrer Selbständigkeit adressiert (z.B. noch keine Validierung, keine zahlenden 
 das benennen und einen Themenwechsel vorschlagen - "Ich glaube, wir haben genug über X gesprochen. \
 Dein eigentliches Risiko ist gerade Y - lass uns da ansetzen." Das ist erwünscht, nicht übergriffig, \
 solange es respektvoll und begründet bleibt, nicht autoritär oder bevormundend.
+- DU DARFST AUCH VON EINER IDEE ABRATEN, NICHT NUR ZUSTIMMEN ODER NEUE VORSCHLAGEN: Mentor sein \
+heisst nicht nur, Möglichkeiten aufzuzeigen. Wenn du aus dem Kontext einschätzt, dass eine Idee \
+aktuell keine gute Priorität ist, sag das direkt und begründet - z.B. "Die Idee passt zu deinen \
+Interessen, aber ich sehe aktuell weder einen klaren Zugang zu Kunden noch einen Grund, warum sie \
+gegenüber [anderes Standbein] jetzt Aufmerksamkeit bekommen sollte." Nicht dogmatisch - die Person \
+darf widersprechen und du akzeptierst das dann. Aber verschweige eine ehrliche Einschätzung nicht \
+nur aus Höflichkeit.
 
 3. FORTLAUFENDE NOTIZEN FÜHREN: Du führst im Hintergrund eigene, wachsende Notizen über die \
 Person - wie ein Mentor, der sich über Monate Beobachtungen macht, die über die starren \
@@ -660,6 +770,26 @@ Validierungsphase - dann darfst du das als eigene Empfehlung vorschlagen, unabh�
 die Person gerade sprach. Nicht bei jeder Nachricht - nur wenn sich aus dem Kontext wirklich eine \
 klare, sinnvolle nächste Handlung ergibt. Bei den meisten Nachrichten bleibt "sole_empfehlung" leer/null.
 
+8. HYPOTHESE BILDEN (unterscheidet sich von einer Beobachtung!): Eine Beobachtung (Funktion 3) ist \
+ein Muster, das du über die Person selbst erkennst. Eine Hypothese ist eine begründete Vermutung über \
+eine STRATEGISCHE FRAGE - z.B. welches Geschäftsmodell passen könnte, ob eine Idee tragfähig ist, \
+welche Kombination von Fähigkeiten besonders wertvoll sein könnte. Wenn sich aus dem Gespräch eine \
+solche Hypothese ergibt, trag sie in "hypothese_vorschlag" ein: {"text": "die Hypothese selbst, kurz", \
+"begruendung": "worauf sie basiert", "standbein_name": "falls sie sich auf ein bestimmtes Standbein \
+bezieht, sonst null", "wuerde_sich_aendern_wenn": "was die Einschätzung verändern würde, optional"}. \
+WICHTIG: eine Hypothese ist ausdrücklich KEINE Tatsache - kennzeichne sie sprachlich auch in "antwort" \
+als Vermutung ("ich vermute", "es könnte sein", "meine Einschätzung wäre"), nie als Gewissheit. Keine \
+Persönlichkeitstypen, keine Scores, keine "Du bist zu X% Y"-Mechanik. Bei den meisten Nachrichten \
+bleibt "hypothese_vorschlag" leer/null.
+
+9. ENTSCHEIDUNG ERKENNEN: Wenn die Person im Gespräch klar und bewusst eine strategische Festlegung \
+trifft (nicht nur eine beiläufige Präferenz, sondern eine echte Entscheidung wie "ich fokussiere mich \
+jetzt 6 Wochen auf X" oder "Y ist erstmal vom Tisch") - trag das in "entscheidung_vorschlag" ein: \
+{"text": "die Entscheidung, so wie getroffen", "standbein_name": "falls zutreffend, sonst null"}. Das \
+ist etwas anderes als eine Aufgabe oder ein Standbein-Update - es hält fest, DASS die Person sich \
+festgelegt hat, damit du das in Zukunft respektierst, statt es zu vergessen oder erneut in Frage zu \
+stellen. Bei den meisten Nachrichten bleibt "entscheidung_vorschlag" leer/null.
+
 Weitere Regeln:
 - Antworte ruhig, präzise, direkt - keine übertriebene Cheerleader-Sprache, keine generischen \
 Komplimente ("Das ist eine tolle Idee!"), keine künstliche Motivation ("Du schaffst das!", \
@@ -708,7 +838,17 @@ Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
   "standbein_update": null,
   "profil_update": null,
   "compass_entwurf": null,
-  "sole_empfehlung": null
+  "sole_empfehlung": null,
+  "hypothese_vorschlag": null,
+  "entscheidung_vorschlag": null
+}
+Falls sich eine Hypothese ergibt, statt null:
+{
+  "hypothese_vorschlag": {"text": "Fractional CoS könnte ein passendes Geschäftsmodell sein", "begruendung": "Kombination aus strategischem Denken und operativer Umsetzung", "standbein_name": "Fractional CoS", "wuerde_sich_aendern_wenn": "wenn Kundengespräche kein Interesse zeigen"}
+}
+Falls eine Entscheidung erkennbar wurde, statt null:
+{
+  "entscheidung_vorschlag": {"text": "Fractional CoS wird für 6 Wochen priorisiert", "standbein_name": "Fractional CoS"}
 }
 Falls Profil-relevante Information erkannt wurde, statt null:
 {
@@ -1227,6 +1367,42 @@ def create_notiz_entry(conn, user_id: int, text: str) -> None:
     )
 
 
+def create_hypothesis_entry(conn, user_id: int, payload: dict) -> None:
+    """Eine begründete Annahme, keine bestätigte Tatsache - ausdrücklich von
+    Sole Observations getrennt (Briefing Punkt 32). Trägt einen Status, den
+    die Person später korrigieren kann (aktiv/bestätigt/widerlegt), statt
+    Hypothesen als unveränderliche Wahrheiten zu behandeln."""
+    import json
+
+    data = {
+        "text": payload.get("text", ""),
+        "begruendung": payload.get("begruendung", ""),
+        "standbein_name": payload.get("standbein_name"),
+        "wuerde_sich_aendern_wenn": payload.get("wuerde_sich_aendern_wenn"),
+        "status": payload.get("status", "aktiv"),
+    }
+    run_write(
+        conn,
+        "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'hypothesis', ?, FALSE, ?)",
+        (user_id, json.dumps(data, ensure_ascii=False), now_iso()),
+    )
+
+
+def create_decision_entry(conn, user_id: int, payload: dict) -> None:
+    """Eine explizite Entscheidung der Person - z.B. 'Fractional CoS wird für
+    6 Wochen priorisiert'. Getrennt von Hypothesen: eine Entscheidung ist
+    kein Verdacht, sondern eine bewusste Festlegung, die Sole respektiert,
+    bis die Person selbst etwas anderes entscheidet."""
+    import json
+
+    data = {"text": payload.get("text", ""), "standbein_name": payload.get("standbein_name")}
+    run_write(
+        conn,
+        "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'decision', ?, FALSE, ?)",
+        (user_id, json.dumps(data, ensure_ascii=False), now_iso()),
+    )
+
+
 def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
     """Legt ein neues Standbein an oder merged in ein bestehendes (nach Name).
     Enthält dieselbe Logik, die vorher inline in /chat stand — jetzt auch von
@@ -1323,33 +1499,40 @@ def apply_compass_entwurf(conn, user_id: int, compass_entwurf: dict) -> None:
 async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     import json
 
-    with get_db() as conn:
-        memory = build_memory_context(conn, user["user_id"])
-        has_profile = bool(fetch_entries(conn, user["user_id"], "profile", limit=1))
+    try:
+        with get_db() as conn:
+            memory = build_memory_context(conn, user["user_id"])
+            has_profile = bool(fetch_entries(conn, user["user_id"], "profile", limit=1))
 
-        # Bisherige Unterhaltung ALS ECHTE NACHRICHTEN abrufen, bevor wir die neue
-        # Nachricht einfügen — das ist entscheidend, damit Claude sich innerhalb
-        # des Gesprächs an bereits gestellte Fragen/Antworten erinnert.
-        previous_turns = fetch_entries_by_types(
-            conn, user["user_id"], ["chat_user", "chat_assistant"], limit=30
-        )
-        previous_turns = list(reversed(previous_turns))  # chronologisch aufsteigend
-
-        if not payload.retry_only:
-            # Normalfall: neue Nachricht wirklich speichern.
-            run_write(
-                conn,
-                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_user', ?, FALSE, ?)",
-                (user["user_id"], payload.message, now_iso()),
+            # Bisherige Unterhaltung ALS ECHTE NACHRICHTEN abrufen, bevor wir die neue
+            # Nachricht einfügen — das ist entscheidend, damit Claude sich innerhalb
+            # des Gesprächs an bereits gestellte Fragen/Antworten erinnert.
+            previous_turns = fetch_entries_by_types(
+                conn, user["user_id"], ["chat_user", "chat_assistant"], limit=30
             )
-        # Bei retry_only=True wurde die Nachricht beim gescheiterten Versuch
-        # bereits gespeichert und steckt schon als letzter Eintrag in
-        # previous_turns - hier NICHT nochmal einfügen.
+            previous_turns = list(reversed(previous_turns))  # chronologisch aufsteigend
 
-    messages = [
-        {"role": "user" if t["type"] == "chat_user" else "assistant", "content": t["content"]}
-        for t in previous_turns
-    ]
+            if not payload.retry_only:
+                # Normalfall: neue Nachricht wirklich speichern.
+                run_write(
+                    conn,
+                    "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_user', ?, FALSE, ?)",
+                    (user["user_id"], payload.message, now_iso()),
+                )
+            # Bei retry_only=True wurde die Nachricht beim gescheiterten Versuch
+            # bereits gespeichert und steckt schon als letzter Eintrag in
+            # previous_turns - hier NICHT nochmal einfügen.
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Vorher war dieser gesamte Block ungeschützt - ein DB-Verbindungsfehler
+        # oder eine fehlgeschlagene Query hier wäre unbehandelt durchgefallen und
+        # hätte, genau wie ein KI-Fehler, nur als generisches "nicht erreichbar"
+        # beim User gelandet, ohne intern unterscheidbar zu sein.
+        log_error("DB_READ_FAILED", str(exc), user_id=user.get("user_id"))
+        raise HTTPException(status_code=503, detail="Datenbank gerade nicht erreichbar.")
+
+    messages = build_messages_with_date_markers(previous_turns)
     if not payload.retry_only:
         messages.append({"role": "user", "content": payload.message})
 
@@ -1360,8 +1543,14 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     else:
         base_prompt = MENTOR_SYSTEM_PROMPT
     heute = datetime.now(timezone.utc).date()
-    wochentage = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-    heute_text = f"Heutiges Datum: {heute.isoformat()} ({wochentage[heute.weekday()]})"
+    heute_text = (
+        f"Heutiges Datum: {heute.isoformat()} ({WOCHENTAGE[heute.weekday()]})\n\n"
+        "Hinweis zum Gesprächsverlauf unten: einzelne frühere Nachrichten können mit einer "
+        "Zeile wie \"[22. August 2026, Freitag]\" beginnen - das markiert einen Tageswechsel im "
+        "Verlauf. Nachrichten OHNE diese Markierung gehören zum selben Tag wie die zuletzt "
+        "markierte. So erkennst du, was HEUTE (siehe Datum oben) und was an einem früheren Tag "
+        "besprochen wurde - wichtig z.B. wenn die Person nach 'gestern' oder 'letzter Woche' fragt."
+    )
     system_prompt = f"{base_prompt}\n\n{heute_text}\n\n--- Bekannte Eckdaten der Person (Profil, Vision, Aufgaben) ---\n{memory}"
     raw = await call_claude(system_prompt, messages)
 
@@ -1376,6 +1565,8 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         profil_update = parsed.get("profil_update")  # aus dem normalen Mentor-Gespräch, nicht Onboarding
         compass_entwurf = parsed.get("compass_entwurf")
         sole_empfehlung = parsed.get("sole_empfehlung")
+        hypothese_vorschlag = parsed.get("hypothese_vorschlag")
+        entscheidung_vorschlag = parsed.get("entscheidung_vorschlag")
     except (json.JSONDecodeError, AttributeError):
         # Falls das Parsen fehlschlägt, nutzen wir die Rohantwort ohne Extraktion,
         # damit der Chat trotzdem funktioniert, statt komplett zu scheitern.
@@ -1387,28 +1578,41 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         profil_update = None
         compass_entwurf = None
         sole_empfehlung = None
+        hypothese_vorschlag = None
+        entscheidung_vorschlag = None
 
-    with get_db() as conn:
-        run_write(
-            conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_assistant', ?, FALSE, ?)",
-            (user["user_id"], antwort, now_iso()),
-        )
+    # Kern-Antwort IMMER sichern und zurückgeben, auch wenn danach beim
+    # Speichern von Aufgaben/Standbein/Profil etwas schiefgeht - eine bereits
+    # fertige, gute Antwort soll nicht verloren gehen, nur weil eine
+    # sekundäre Extraktion scheitert (siehe Briefing Punkt 29).
+    try:
+        with get_db() as conn:
+            run_write(
+                conn,
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'chat_assistant', ?, FALSE, ?)",
+                (user["user_id"], antwort, now_iso()),
+            )
+    except Exception as exc:
+        log_error("DB_WRITE_FAILED", f"chat_assistant konnte nicht gespeichert werden: {exc}", user_id=user.get("user_id"))
+        # Antwort trotzdem zurückgeben - sie fehlt dann nur im künftigen
+        # Verlauf, ist aber für DIESE Antwort nicht verloren.
 
-        erstellte_aufgaben = []
-        profil_gespeichert = False
-        standbein_gespeichert = False
-        vorschlaege = []  # nur befüllt, wenn confirm_mode=True
+    erstellte_aufgaben = []
+    profil_gespeichert = False
+    standbein_gespeichert = False
+    vorschlaege = []  # nur befüllt, wenn confirm_mode=True
 
-        # Profil aus dem Onboarding-Gespräch: hat schon eine eigene explizite
-        # Bestätigung DURCH DAS GESPRÄCH SELBST ("Hab ich das richtig
-        # verstanden?") bevor das JSON überhaupt ausgefüllt zurückkommt -
-        # zählt als bereits bestätigt, wird unabhängig von confirm_mode
-        # direkt gespeichert (Briefing: "Explizit im Onboarding angegebene
-        # Informationen dürfen direkt gespeichert werden").
-        if isinstance(neues_profil, dict) and neues_profil:
-            save_profile_merged(conn, user["user_id"], neues_profil)
-            profil_gespeichert = True
+    try:
+        with get_db() as conn:
+            # Profil aus dem Onboarding-Gespräch: hat schon eine eigene explizite
+            # Bestätigung DURCH DAS GESPRÄCH SELBST ("Hab ich das richtig
+            # verstanden?") bevor das JSON überhaupt ausgefüllt zurückkommt -
+            # zählt als bereits bestätigt, wird unabhängig von confirm_mode
+            # direkt gespeichert (Briefing: "Explizit im Onboarding angegebene
+            # Informationen dürfen direkt gespeichert werden").
+            if isinstance(neues_profil, dict) and neues_profil:
+                save_profile_merged(conn, user["user_id"], neues_profil)
+                profil_gespeichert = True
 
         if payload.confirm_mode:
             # Neues Verhalten: nichts automatisch speichern, nur vorschlagen.
@@ -1465,6 +1669,21 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                     "payload": {"inhalt": sole_empfehlung["inhalt"], "faellig": sole_empfehlung.get("faellig")},
                     "begruendung": sole_empfehlung.get("begruendung", ""),
                 })
+
+            if isinstance(hypothese_vorschlag, dict) and hypothese_vorschlag.get("text"):
+                vorschlaege.append({
+                    "kind": "hypothesis",
+                    "label": hypothese_vorschlag["text"],
+                    "payload": hypothese_vorschlag,
+                    "begruendung": hypothese_vorschlag.get("begruendung", ""),
+                })
+
+            if isinstance(entscheidung_vorschlag, dict) and entscheidung_vorschlag.get("text"):
+                vorschlaege.append({
+                    "kind": "decision",
+                    "label": entscheidung_vorschlag["text"],
+                    "payload": entscheidung_vorschlag,
+                })
         else:
             # Altes Verhalten, unverändert für das bestehende Frontend:
             # sofort automatisch speichern.
@@ -1492,6 +1711,17 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
             if isinstance(sole_empfehlung, dict) and sole_empfehlung.get("inhalt"):
                 create_task_entry(conn, user["user_id"], sole_empfehlung["inhalt"], sole_empfehlung.get("faellig"))
                 erstellte_aufgaben.append(sole_empfehlung["inhalt"])
+
+            if isinstance(hypothese_vorschlag, dict) and hypothese_vorschlag.get("text"):
+                create_hypothesis_entry(conn, user["user_id"], hypothese_vorschlag)
+
+            if isinstance(entscheidung_vorschlag, dict) and entscheidung_vorschlag.get("text"):
+                create_decision_entry(conn, user["user_id"], entscheidung_vorschlag)
+    except Exception as exc:
+        # Sekundäre Extraktion (Aufgaben/Standbein/Profil/Compass) fehlgeschlagen -
+        # die Chat-Antwort selbst bleibt trotzdem erhalten und wird unten
+        # zurückgegeben, nur eben ohne die zusätzlichen Vorschläge dieser Runde.
+        log_error("SECONDARY_EXTRACTION_FAILED", str(exc), user_id=user.get("user_id"))
 
     return {
         "answer": antwort,
@@ -1524,9 +1754,52 @@ def confirm_suggestion(body: SuggestionConfirmIn, user: dict = Depends(get_curre
             save_profile_merged(conn, user["user_id"], body.payload)
         elif body.kind == "compass_draft":
             apply_compass_entwurf(conn, user["user_id"], body.payload)
+        elif body.kind == "hypothesis":
+            create_hypothesis_entry(conn, user["user_id"], body.payload)
+        elif body.kind == "decision":
+            create_decision_entry(conn, user["user_id"], body.payload)
         else:
             raise HTTPException(status_code=400, detail=f"Unbekannte Vorschlagsart: {body.kind}")
     return {"ok": True}
+
+
+@app.get("/hypotheses")
+def get_hypotheses(user: dict = Depends(get_current_user)):
+    """Alle Hypothesen der Person, neueste zuerst — ausdrücklich getrennt von
+    Sole Observations (mentor_notiz) und Fakten (profile), siehe Briefing Punkt 32."""
+    import json
+
+    with get_db() as conn:
+        rows = fetch_entries(conn, user["user_id"], "hypothesis", limit=50)
+    result = []
+    for r in rows:
+        try:
+            data = json.loads(r["content"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        data["id"] = r["id"]
+        data["created_at"] = r["created_at"]
+        result.append(data)
+    return {"hypotheses": result}
+
+
+@app.get("/decisions")
+def get_decisions(user: dict = Depends(get_current_user)):
+    """Alle bewussten Entscheidungen der Person, neueste zuerst."""
+    import json
+
+    with get_db() as conn:
+        rows = fetch_entries(conn, user["user_id"], "decision", limit=50)
+    result = []
+    for r in rows:
+        try:
+            data = json.loads(r["content"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        data["id"] = r["id"]
+        data["created_at"] = r["created_at"]
+        result.append(data)
+    return {"decisions": result}
 
 
 # ---------------------------------------------------------------------------
