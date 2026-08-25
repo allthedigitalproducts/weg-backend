@@ -130,6 +130,8 @@ if USE_POSTGRES:
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS estimated_minutes INTEGER")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS venture_id INTEGER")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS milestone_text TEXT")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS test_id TEXT")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS milestone_id TEXT")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS sole_priority INTEGER")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS priority_reason TEXT")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual'")
@@ -205,6 +207,7 @@ else:
                 "status TEXT DEFAULT 'open'", "deadline TEXT", "estimated_minutes INTEGER",
                 "venture_id INTEGER", "milestone_text TEXT", "sole_priority INTEGER",
                 "priority_reason TEXT", "source TEXT DEFAULT 'manual'", "completed_at TEXT",
+                "test_id TEXT", "milestone_id TEXT",
             ]:
                 try:
                     conn.execute(f"ALTER TABLE entries ADD COLUMN {col_def}")
@@ -238,6 +241,8 @@ class EntryIn(BaseModel):
     venture_id: Optional[int] = None
     milestone_text: Optional[str] = None
     source: Optional[str] = "manual"
+    test_id: Optional[str] = None
+    milestone_id: Optional[str] = None
 
 
 class EntryUpdate(BaseModel):
@@ -254,6 +259,8 @@ class EntryUpdate(BaseModel):
     milestone_text: Optional[str] = None
     sole_priority: Optional[int] = None
     priority_reason: Optional[str] = None
+    test_id: Optional[str] = None
+    milestone_id: Optional[str] = None
 
 
 class ChatIn(BaseModel):
@@ -750,25 +757,41 @@ bewusst zurückgestellt). Setze das NUR, wenn aus dem Gespräch wirklich eine kl
 Entscheidung hervorgeht (z.B. "lass uns X jetzt zur Priorität machen" oder "Y parken wir erstmal") - \
 nicht bei jedem beiläufigen standbein_update automatisch mitschicken, sonst verliert primary seine \
 Bedeutung. Es sollte in der Regel höchstens EIN Standbein gleichzeitig primary sein.
-- MEILENSTEIN AUCH EIGENSTÄNDIG VORSCHLAGEN DÜRFEN: du musst nicht auf eine grosse Standbein-Änderung \
-warten, um einen Meilenstein vorzuschlagen. Wenn für ein BEREITS BEKANNTES Standbein aus dem Gespräch \
-ein sinnvoller nächster Meilenstein erkennbar wird (auch wenn sich sonst nichts am Standbein ändert), \
-trag "standbein_update" mit nur "name" und "meilensteine" ein, ohne "phase"/"vision" zu setzen - dann \
-bleibt der Rest des Standbeins unverändert, nur der Meilenstein kommt dazu. Meilensteine sind Ergebnisse \
-("Erster zahlender Kunde"), keine Aufgaben ("Angebot verschicken" gehört zu den Aufgaben, nicht hierher).
-- SPRACHE GEGENÜBER DER PERSON: sprich in "antwort" NICHT von "Meilenstein" oder "Beweis" - nutze \
-"Test" ("dein nächster Test wäre..."). Intern/im JSON heisst das Feld weiterhin "meilensteine", das \
-ist nur ein Datenmodell-Name, keine Vorgabe für deine gesprochene Sprache.
+- MEILENSTEIN VS. AKTUELLER TEST — ECHTE TRENNUNG, NICHT NUR SPRACHLICH: das sind zwei verschiedene \
+Felder mit unterschiedlicher Bedeutung, keine Synonyme.
+  MEILENSTEIN ("meilensteine"): ein erreichter oder angestrebter ZUSTAND/OUTCOME, z.B. "Erster \
+zahlender Kunde", "4k CHF/Monat erreicht", "Angebot & Pricing definiert". Ein Standbein hat mehrere \
+geordnete Meilensteine (die Journey). Jeder hat "status": "erreicht" oder "offen" - trag NIE selbst \
+"aktuell" ein, das wird automatisch aus dem ersten offenen Meilenstein abgeleitet.
+  AKTUELLER TEST ("aktueller_test"): die AKTIVITÄT/das Experiment, mit dem GERADE eine Annahme \
+geprüft oder der nächste Meilenstein vorbereitet wird, z.B. "3-5 Explorationsgespräche führen". Es \
+gibt zu jedem Zeitpunkt höchstens EINEN aktuellen Test pro Standbein - ein neuer "aktueller_test" \
+ERSETZT den alten (der alte bleibt intern nachvollziehbar, das übernimmt das Backend automatisch).
+  Merksatz: Meilenstein = WAS erreicht sein soll. Test = WIE gerade geprüft wird, ob's dahin geht.
+- MEILENSTEIN ODER TEST AUCH EIGENSTÄNDIG VORSCHLAGEN DÜRFEN: du musst nicht auf eine grosse \
+Standbein-Änderung warten. Wenn für ein BEREITS BEKANNTES Standbein aus dem Gespräch ein sinnvoller \
+nächster Meilenstein ODER ein neuer aktueller Test erkennbar wird (auch wenn sich sonst nichts \
+ändert), trag "standbein_update" mit nur "name" und dem jeweiligen Feld ein - der Rest bleibt \
+unverändert. Meilensteine sind Ergebnisse ("Erster zahlender Kunde"), keine Aufgaben ("Angebot \
+verschicken" gehört zu den Aufgaben in "neue_aufgaben", nicht hierher).
+- SPRACHE GEGENÜBER DER PERSON: sprich in "antwort" natürlich von "Meilenstein" oder "Test" - beides \
+sind jetzt echte, unterschiedliche Konzepte, kein reines Sprachlabel mehr. Nicht "Beweis" verwenden.
 - WENN DU EINEN TEST VORSCHLÄGST, BEGRÜNDE IHN UND ZEIG DIE KONSEQUENZ: ein guter Test beantwortet \
 nicht nur "was", sondern auch "warum genau das" und "was passiert je nach Ergebnis". Nutze dafür \
-optional "warum" beim Meilenstein-Eintrag, und wenn die Person schon erkennbar unterschiedliche \
-Konsequenzen je nach Testausgang durchdacht hat, trag das in "entscheidungsbaum" ein: \
+"warum" bei "aktueller_test", und wenn die Person schon erkennbar unterschiedliche Konsequenzen je \
+nach Testausgang durchdacht hat, trag das in "entscheidungsbaum" ein: \
 {"wenn_bestaetigt": "...", "wenn_unklar": "...", "wenn_negativ": "..."} - nur wenn das wirklich aus \
 dem Gespräch hervorgeht, nicht erfinden.
+- WENN EIN TEST ABGESCHLOSSEN WIRD: prüfe anschliessend aktiv, ob der jetzt aktuelle (nächste offene) \
+Meilenstein strategisch noch sinnvoll ist, und schlage bei Bedarf eine Änderung vor - nicht einfach \
+stillschweigend weitermachen.
 - ANNAHMEN FESTHALTEN: wenn im Gespräch klar wird, dass eine Empfehlung auf unbewiesenen Annahmen \
 beruht (z.B. "Unternehmen haben dieses Problem", "sie sind bereit, dafür zu bezahlen") - trag diese \
 kurz und stichpunktartig in "annahmen" ein (Liste). Das macht sichtbar, worauf eine Einschätzung \
 eigentlich beruht, nicht nur das Ergebnis.
+- AKTUELLEN STAND PFLEGEN: "aktueller_stand" ist ein eigenständiges, kurzes Freitextfeld ("wo stehen \
+wir gerade") - NICHT automatisch aus den Meilensteinen ableiten, sondern so setzen, wie die Person es \
+im Gespräch tatsächlich beschreibt. Nur aktualisieren, wenn sich wirklich etwas Neues ergibt.
 
 5. PROFIL-INFORMATION ERKENNEN: Wenn die Person im normalen Gespräch etwas wirklich Bedeutsames \
 über sich, ihre Situation, ihre Ziele oder Arbeitsweise preisgibt (nicht im Onboarding/Check-in, \
@@ -813,7 +836,8 @@ erfasst Aufgaben, die die Person SELBST erwähnt hat. Hier geht es um das Gegent
 strategischen Kontext erkennst, dass ein bestimmter nächster Schritt sinnvoll wäre - auch wenn die \
 Person ihn nicht erwähnt oder sogar über etwas ganz anderes geredet hat - schlage ihn aktiv vor, in \
 "sole_empfehlung": {"inhalt": "konkreter nächster Schritt", "faellig": "heute/morgen/diese_woche/ \
-Datum/null", "begruendung": "1 kurzer Satz, warum das gerade wichtig ist"}. Beispiel: die Person \
+Datum/null", "begruendung": "1 kurzer Satz, warum das gerade wichtig ist", "standbein_name": "Name des \
+Standbeins, falls zutreffend - sonst weglassen"}. Beispiel: die Person \
 erzählt lange von Branding und Website, aber es gibt laut Kontext noch keine Kundengespräche in der \
 Validierungsphase - dann darfst du das als eigene Empfehlung vorschlagen, unabhängig davon, wovon \
 die Person gerade sprach. Nicht bei jeder Nachricht - nur wenn sich aus dem Kontext wirklich eine \
@@ -879,7 +903,7 @@ Antworte AUSSCHLIESSLICH als JSON in diesem Format - KEIN Text davor, KEIN Text 
 {
   "antwort": "deine eigentliche Chat-Antwort als Sparring-Partner, kann Markdown enthalten (**fett**, > Zitate)",
   "neue_aufgaben": [
-    {"inhalt": "konkrete Aufgabe", "faellig": "heute"},
+    {"inhalt": "konkrete Aufgabe", "faellig": "heute", "standbein_name": "Name des Standbeins, falls die Aufgabe zu einem gehört - sonst weglassen/null"},
     {"inhalt": "Aufgabe für einen bestimmten Tag", "faellig": "2026-08-25"},
     {"inhalt": "andere Aufgabe", "faellig": null}
   ],
@@ -918,13 +942,15 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
     "phase": "idee | validieren | aufbauen | umsetzen | wachsen (nur falls erkennbar, sonst weglassen)",
     "focus": "primary | secondary | parked (nur falls sich die Priorität im Gespräch wirklich ändert oder ein neues Standbein entsteht - sonst weglassen, nicht bei jedem Standbein-Update mitschicken)",
     "ziel": "was konkret erreicht werden soll (optional, nur wenn klar unterscheidbar von 'vision')",
+    "aktueller_stand": "EIN kurzer Satz, wo die Person gerade steht, z.B. 'Angebot definiert, erste Akquise gestartet' - eigenständiges Feld, NICHT aus den Meilensteinen ableiten, sondern so wie im Gespräch tatsächlich beschrieben",
     "annahmen": ["Liste kurzer Annahmen, die gerade gemacht werden, aber noch nicht bewiesen sind - optional"],
-    "entscheidungsbaum": {"wenn_bestaetigt": "was passiert, wenn der Test positiv ausfällt", "wenn_unklar": "...", "wenn_negativ": "..."},
+    "entscheidungsbaum": {"wenn_bestaetigt": "was passiert, wenn der aktuelle Test positiv ausfällt", "wenn_unklar": "...", "wenn_negativ": "..."},
     "zeithorizont": "z.B. '6-8 Wochen' - nur wenn aus dem Gespräch erkennbar, sonst weglassen",
     "card_begruendung": "EIN kurzer Satz (max. ca. 12 Wörter), warum dieses Standbein gerade diese Priorität hat - erscheint auf der Compass-Übersichtskarte, wo wenig Platz ist. Keine Zahlen/Preise/Pakete hier - die gehören auf die Standbein-Seite, nicht in 'vision'.",
     "meilensteine": [
-      {"text": "konkreter nächster Test", "datum": "2026-08-25 oder null", "messgroesse": "optional", "warum": "kurz, warum genau dieser Test - optional"}
-    ]
+      {"text": "ein ERREICHTES ODER ANGESTREBTES ERGEBNIS, z.B. 'Erster zahlender Kunde' oder '4k CHF/Monat erreicht' - KEINE Aktivität/Test, sondern ein Zustand", "datum": "2026-08-25 oder null", "messgroesse": "optional", "warum": "kurz, warum genau dieser Meilenstein wichtig ist - optional"}
+    ],
+    "aktueller_test": {"text": "die AKTUELLE Aktivität/das Experiment, mit dem gerade eine Annahme geprüft oder der nächste Meilenstein vorbereitet wird, z.B. '3-5 Explorationsgespräche führen' - KEIN Ergebnis-Zustand, sondern eine Tätigkeit", "warum": "kurz, warum genau dieser Test - optional", "datum": null}
   }
 }
 Falls sich aus dem Gespräch ein erster oder aktualisierter Compass-Entwurf ergibt, statt null:
@@ -939,7 +965,7 @@ Falls sich aus dem Gespräch ein erster oder aktualisierter Compass-Entwurf ergi
 }
 Falls du selbst einen nächsten Schritt empfiehlst (unabhängig davon, worüber die Person sprach), statt null:
 {
-  "sole_empfehlung": {"inhalt": "konkreter nächster Schritt", "faellig": "diese_woche", "begruendung": "1 Satz, warum das gerade zählt"}
+  "sole_empfehlung": {"inhalt": "konkreter nächster Schritt", "faellig": "diese_woche", "begruendung": "1 Satz, warum das gerade zählt", "standbein_name": "falls zutreffend, sonst weglassen"}
 }
 Falls keine Aufgaben erkennbar sind: "neue_aufgaben": []"""
 
@@ -1176,12 +1202,12 @@ def create_entry(entry: EntryIn, user: dict = Depends(get_current_user)):
             conn,
             """INSERT INTO entries
                (user_id, type, content, done, due_date, status, deadline,
-                estimated_minutes, venture_id, milestone_text, source, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                estimated_minutes, venture_id, milestone_text, source, test_id, milestone_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user["user_id"], entry.type, entry.content, initial_done, entry.due_date,
                 initial_status, entry.deadline, entry.estimated_minutes, entry.venture_id,
-                entry.milestone_text, entry.source or "manual", now_iso(),
+                entry.milestone_text, entry.source or "manual", entry.test_id, entry.milestone_id, now_iso(),
             ),
         )
         return {"id": new_id}
@@ -1259,6 +1285,18 @@ def update_entry(entry_id: int, update: EntryUpdate, user: dict = Depends(get_cu
                 conn,
                 "UPDATE entries SET milestone_text = ? WHERE id = ? AND user_id = ?",
                 (update.milestone_text, entry_id, user["user_id"]),
+            )
+        if update.test_id is not None:
+            run_write(
+                conn,
+                "UPDATE entries SET test_id = ? WHERE id = ? AND user_id = ?",
+                (update.test_id, entry_id, user["user_id"]),
+            )
+        if update.milestone_id is not None:
+            run_write(
+                conn,
+                "UPDATE entries SET milestone_id = ? WHERE id = ? AND user_id = ?",
+                (update.milestone_id, entry_id, user["user_id"]),
             )
         if update.sole_priority is not None:
             run_write(
@@ -1434,12 +1472,39 @@ async def chat_start(payload: ChatStartIn, user: dict = Depends(get_current_user
     return {"answer": antwort}
 
 
-def create_task_entry(conn, user_id: int, inhalt: str, faellig_label: Optional[str]) -> None:
+def resolve_standbein_reference(conn, user_id: int, standbein_name: Optional[str]) -> tuple:
+    """Löst einen Standbein-Namen (wie Sole ihn im Gespräch nennt) zu
+    (venture_id, aktueller_test_id) auf - damit von Sole erstellte Tasks
+    tatsächlich verknüpft werden, statt wie bisher immer unverknüpft zu
+    bleiben. Gibt (None, None) zurück, wenn kein Name angegeben oder kein
+    passendes Standbein gefunden wurde - kein Fehler, einfach unverknüpft."""
+    import json
+
+    if not standbein_name:
+        return (None, None)
+    gesuchter_name = standbein_name.strip().lower()
+    for v in fetch_entries(conn, user_id, "venture", limit=50):
+        try:
+            v_data = json.loads(v["content"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if v_data.get("name", "").strip().lower() == gesuchter_name:
+            aktueller_test = v_data.get("aktueller_test")
+            test_id = aktueller_test.get("id") if isinstance(aktueller_test, dict) else None
+            return (v["id"], test_id)
+    return (None, None)
+
+
+def create_task_entry(
+    conn, user_id: int, inhalt: str, faellig_label: Optional[str],
+    venture_id: Optional[int] = None, test_id: Optional[str] = None, milestone_id: Optional[str] = None,
+) -> None:
     due = due_date_from_label(faellig_label)
     run_write(
         conn,
-        "INSERT INTO entries (user_id, type, content, done, due_date, created_at) VALUES (?, 'task', ?, FALSE, ?, ?)",
-        (user_id, inhalt, due, now_iso()),
+        """INSERT INTO entries (user_id, type, content, done, due_date, venture_id, test_id, milestone_id, created_at)
+           VALUES (?, 'task', ?, FALSE, ?, ?, ?, ?, ?)""",
+        (user_id, inhalt, due, venture_id, test_id, milestone_id, now_iso()),
     )
 
 
@@ -1509,6 +1574,7 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             continue
 
     neue_meilensteine = standbein_update.get("meilensteine", []) or []
+    neuer_test = standbein_update.get("aktueller_test")
 
     if passendes_venture:
         venture_id, v_data = passendes_venture
@@ -1522,6 +1588,8 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             v_data["focus"] = standbein_update["focus"]
         if standbein_update.get("ziel"):
             v_data["ziel"] = standbein_update["ziel"]
+        if standbein_update.get("aktueller_stand"):
+            v_data["aktueller_stand"] = standbein_update["aktueller_stand"]
         if standbein_update.get("annahmen"):
             v_data["annahmen"] = standbein_update["annahmen"]
         if standbein_update.get("entscheidungsbaum"):
@@ -1538,12 +1606,14 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
                     "id": secrets.token_hex(4),
                     "text": m.get("text", ""),
                     "datum": m.get("datum"),
-                    "erledigt": False,
+                    "status": "offen",
                     "messgroesse": m.get("messgroesse", ""),
                     "warum": m.get("warum", ""),
                 })
         v_data["meilensteine"] = bestehende_meilensteine
         v_data["umsatz"] = normalize_umsatz(v_data.get("umsatz"))
+        if isinstance(neuer_test, dict) and neuer_test.get("text"):
+            v_data = _standbein_aktueller_test_setzen(v_data, neuer_test)
         run_write(
             conn,
             "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
@@ -1557,29 +1627,53 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             "role": standbein_update.get("role", ""),
             "focus": standbein_update.get("focus") if standbein_update.get("focus") in VENTURE_FOCUS_OPTIONS else "secondary",
             "ziel": standbein_update.get("ziel", ""),
+            "aktueller_stand": standbein_update.get("aktueller_stand", ""),
             "annahmen": standbein_update.get("annahmen", []),
             "entscheidungsbaum": standbein_update.get("entscheidungsbaum", {}),
             "zeithorizont": standbein_update.get("zeithorizont", ""),
             "card_begruendung": standbein_update.get("card_begruendung", ""),
             "umsatz": [],
+            "aktueller_test": None,
+            "test_historie": [],
             "meilensteine": [
                 {
                     "id": secrets.token_hex(4),
                     "text": m.get("text", ""),
                     "datum": m.get("datum"),
-                    "erledigt": False,
+                    "status": "offen",
                     "messgroesse": m.get("messgroesse", ""),
                     "warum": m.get("warum", ""),
                 }
                 for m in neue_meilensteine if isinstance(m, dict)
             ],
         }
+        if isinstance(neuer_test, dict) and neuer_test.get("text"):
+            neues_venture = _standbein_aktueller_test_setzen(neues_venture, neuer_test)
         run_write(
             conn,
             "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'venture', ?, FALSE, ?)",
             (user_id, json.dumps(neues_venture, ensure_ascii=False), now_iso()),
         )
     return True
+
+
+def _standbein_aktueller_test_setzen(v_data: dict, neuer_test: dict) -> dict:
+    """Setzt einen neuen aktuellen Test - der bisherige (falls vorhanden) wird
+    NICHT überschrieben/verworfen, sondern in 'test_historie' archiviert, damit
+    Tasks, die an die alte test_id gebunden sind, weiterhin nachvollziehbar
+    bleiben (Briefing: 'Test sollte historisch nachvollziehbar bleiben')."""
+    alter_test = v_data.get("aktueller_test")
+    if isinstance(alter_test, dict) and alter_test.get("id"):
+        historie = v_data.get("test_historie") or []
+        historie.append({**alter_test, "abgeschlossen_am": now_iso()})
+        v_data["test_historie"] = historie
+    v_data["aktueller_test"] = {
+        "id": secrets.token_hex(4),
+        "text": neuer_test.get("text", ""),
+        "warum": neuer_test.get("warum", ""),
+        "datum": neuer_test.get("datum"),
+    }
+    return v_data
 
 
 def apply_compass_entwurf(conn, user_id: int, compass_entwurf: dict) -> None:
@@ -1729,9 +1823,10 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
             for aufgabe in neue_aufgaben:
                 inhalt = aufgabe.get("inhalt", "") if isinstance(aufgabe, dict) else str(aufgabe)
                 faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
+                std_name = aufgabe.get("standbein_name") if isinstance(aufgabe, dict) else None
                 if not inhalt:
                     continue
-                vorschlaege.append({"kind": "task", "label": inhalt, "payload": {"inhalt": inhalt, "faellig": faellig_label}})
+                vorschlaege.append({"kind": "task", "label": inhalt, "payload": {"inhalt": inhalt, "faellig": faellig_label, "standbein_name": std_name}})
 
             if isinstance(notiz_update, str) and notiz_update.strip():
                 text = notiz_update.strip()
@@ -1776,7 +1871,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 vorschlaege.append({
                     "kind": "sole_task",
                     "label": sole_empfehlung["inhalt"],
-                    "payload": {"inhalt": sole_empfehlung["inhalt"], "faellig": sole_empfehlung.get("faellig")},
+                    "payload": {"inhalt": sole_empfehlung["inhalt"], "faellig": sole_empfehlung.get("faellig"), "standbein_name": sole_empfehlung.get("standbein_name")},
                     "begruendung": sole_empfehlung.get("begruendung", ""),
                 })
 
@@ -1822,7 +1917,9 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
                 if not inhalt:
                     continue
-                create_task_entry(conn, user["user_id"], inhalt, faellig_label)
+                std_name = aufgabe.get("standbein_name") if isinstance(aufgabe, dict) else None
+                v_id, t_id = resolve_standbein_reference(conn, user["user_id"], std_name)
+                create_task_entry(conn, user["user_id"], inhalt, faellig_label, v_id, t_id)
                 erstellte_aufgaben.append(inhalt)
 
             if isinstance(notiz_update, str) and notiz_update.strip():
@@ -1839,7 +1936,8 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 standbein_gespeichert = True
 
             if isinstance(sole_empfehlung, dict) and sole_empfehlung.get("inhalt"):
-                create_task_entry(conn, user["user_id"], sole_empfehlung["inhalt"], sole_empfehlung.get("faellig"))
+                v_id, t_id = resolve_standbein_reference(conn, user["user_id"], sole_empfehlung.get("standbein_name"))
+                create_task_entry(conn, user["user_id"], sole_empfehlung["inhalt"], sole_empfehlung.get("faellig"), v_id, t_id)
                 erstellte_aufgaben.append(sole_empfehlung["inhalt"])
 
             if isinstance(hypothese_vorschlag, dict) and hypothese_vorschlag.get("text"):
@@ -1888,7 +1986,8 @@ def confirm_suggestion(body: SuggestionConfirmIn, user: dict = Depends(get_curre
     'Übernehmen' o.ä. geklickt wird."""
     with get_db() as conn:
         if body.kind in ("task", "sole_task"):
-            create_task_entry(conn, user["user_id"], body.payload.get("inhalt", ""), body.payload.get("faellig"))
+            v_id, t_id = resolve_standbein_reference(conn, user["user_id"], body.payload.get("standbein_name"))
+            create_task_entry(conn, user["user_id"], body.payload.get("inhalt", ""), body.payload.get("faellig"), v_id, t_id)
         elif body.kind == "notiz":
             create_notiz_entry(conn, user["user_id"], body.payload.get("text", ""))
         elif body.kind in ("standbein", "milestone"):
@@ -2399,10 +2498,20 @@ def get_journey(user: dict = Depends(get_current_user)):
 
 
 class MeilensteinIn(BaseModel):
+    id: str = ""
     text: str
     datum: Optional[str] = None  # ISO-Datum YYYY-MM-DD, optional
-    erledigt: bool = False
+    erledigt: bool = False  # veraltet, wird zu status migriert - bleibt für Rückwärtskompatibilität
+    status: str = ""  # "erreicht" | "offen" - "aktuell" wird im Frontend abgeleitet, nicht gespeichert
     messgroesse: str = ""  # "Wie misst du, ob's erreicht ist?" — optional
+    warum: str = ""
+
+
+class TestIn(BaseModel):
+    id: str = ""
+    text: str
+    warum: str = ""
+    datum: Optional[str] = None
 
 
 class UmsatzEintragIn(BaseModel):
@@ -2429,26 +2538,38 @@ class VentureIn(BaseModel):
     notizen: str = ""
     zeithorizont: str = ""
     card_begruendung: str = ""
+    aktueller_stand: str = ""
+    aktueller_test: Optional[TestIn] = None
+    test_historie: list[dict] = []
 
 
 def normalize_meilensteine(raw) -> list:
     """Alte Ventures hatten 'meilensteine' als einen einzigen Textblock ohne Datum.
-    Wandelt das für die Anzeige in die neue Listenform um, ohne Daten zu verlieren."""
+    Wandelt das für die Anzeige in die neue Listenform um, ohne Daten zu verlieren.
+    Migriert ausserdem das alte 'erledigt'-Bool zu 'status' (erreicht/offen) -
+    'aktuell' wird bewusst NICHT gespeichert, sondern im Frontend aus dem ersten
+    'offen'-Eintrag abgeleitet (einfacher, kein Risiko von zwei "aktuell"
+    gleichzeitig, Nachrücken passiert automatisch ohne eigene Logik)."""
     if isinstance(raw, str):
         if not raw.strip():
             return []
-        return [{"text": raw, "datum": None, "erledigt": False, "messgroesse": ""}]
+        return [{"id": secrets.token_hex(4), "text": raw, "datum": None, "status": "offen", "messgroesse": "", "warum": ""}]
     if isinstance(raw, list):
         for m in raw:
             if isinstance(m, dict):
-                if "erledigt" not in m:
-                    m["erledigt"] = False
                 if "messgroesse" not in m:
                     m["messgroesse"] = ""
                 if "warum" not in m:
                     m["warum"] = ""
                 if "id" not in m:
                     m["id"] = secrets.token_hex(4)
+                if not m.get("status"):
+                    # Migration: altes 'erledigt' übersetzen, dann als 'erledigt'
+                    # entfernen wir es nicht - manche älteren Frontend-Instanzen
+                    # könnten es noch lesen, aber 'status' ist ab jetzt die
+                    # massgebliche Quelle.
+                    m["status"] = "erreicht" if m.get("erledigt") else "offen"
+                m["erledigt"] = m["status"] == "erreicht"  # Spiegel, für Abwärtskompatibilität
         return raw
     return []
 
@@ -2482,8 +2603,18 @@ def get_strategy(user: dict = Depends(get_current_user)):
                 data["focus"] = "secondary"
             if "role" not in data:
                 data["role"] = ""
+            if "aktueller_stand" not in data:
+                data["aktueller_stand"] = ""
+            if "aktueller_test" not in data:
+                data["aktueller_test"] = None
+            if "test_historie" not in data:
+                data["test_historie"] = []
             ventures.append(data)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            # Vorher wurde das Standbein hier ohne jede Spur übersprungen -
+            # wäre einfach aus jeder Ansicht verschwunden, ohne dass sichtbar
+            # geworden wäre, warum. Jetzt zumindest diagnostizierbar.
+            log_error("VENTURE_PARSE_FAILED", f"entry_id={v['id']}: {exc}", user_id=user.get("user_id"))
             continue
 
     return {
@@ -2584,7 +2715,8 @@ def complete_milestone(venture_id: int, index: int, user: dict = Depends(get_cur
         if index < 0 or index >= len(meilensteine):
             raise HTTPException(status_code=404, detail="Meilenstein nicht gefunden.")
 
-        meilensteine[index]["erledigt"] = True
+        meilensteine[index]["status"] = "erreicht"
+        meilensteine[index]["erledigt"] = True  # Spiegel, für Abwärtskompatibilität
         v_data["meilensteine"] = meilensteine
         run_write(
             conn,
@@ -2592,6 +2724,41 @@ def complete_milestone(venture_id: int, index: int, user: dict = Depends(get_cur
             (json.dumps(v_data, ensure_ascii=False), venture_id, user["user_id"]),
         )
         return {"ok": True, "milestone_text": meilensteine[index]["text"], "venture_name": v_data.get("name", "")}
+
+
+@app.post("/strategy/venture/{venture_id}/test/complete")
+def complete_test(venture_id: int, user: dict = Depends(get_current_user)):
+    """Archiviert den aktuellen Test nach test_historie (bleibt nachvollziehbar,
+    Tasks mit dieser test_id zeigen weiterhin auf einen echten, auffindbaren
+    Eintrag). Löscht NICHT einfach - setzt nur aktueller_test auf None. Die
+    eigentliche Auswertung passiert bewusst im Chat, nicht automatisch hier."""
+    import json
+
+    with get_db() as conn:
+        rows = run_query(
+            conn, "SELECT * FROM entries WHERE id = ? AND user_id = ?", (venture_id, user["user_id"])
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Standbein nicht gefunden.")
+        try:
+            v_data = json.loads(rows[0]["content"])
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=500, detail="Standbein-Daten beschädigt.")
+
+        aktueller_test = v_data.get("aktueller_test")
+        if not isinstance(aktueller_test, dict) or not aktueller_test.get("text"):
+            raise HTTPException(status_code=404, detail="Kein aktueller Test vorhanden.")
+
+        historie = v_data.get("test_historie") or []
+        historie.append({**aktueller_test, "abgeschlossen_am": now_iso()})
+        v_data["test_historie"] = historie
+        v_data["aktueller_test"] = None
+        run_write(
+            conn,
+            "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
+            (json.dumps(v_data, ensure_ascii=False), venture_id, user["user_id"]),
+        )
+        return {"ok": True, "test_text": aktueller_test["text"], "venture_name": v_data.get("name", "")}
 
 
 # ---------------------------------------------------------------------------
