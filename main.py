@@ -457,16 +457,23 @@ def build_memory_context(conn, user_id: int) -> str:
         for v in ventures_raw:
             try:
                 data = json.loads(v["content"])
-                line = f"- {data.get('name', 'unbenannt')}: {data.get('vision', '')}"
+                line = f"- {data.get('name', 'unbenannt')} [Priorität: {data.get('focus', 'secondary')}, Phase: {data.get('phase', 'idee')}]: {data.get('vision', '')}"
+                if data.get("aktueller_stand"):
+                    line += f" | Aktueller Stand: {data['aktueller_stand']}"
+                aktueller_test = data.get("aktueller_test")
+                if isinstance(aktueller_test, dict) and aktueller_test.get("text"):
+                    line += f" | Aktueller Test: {aktueller_test['text']}"
+                    if aktueller_test.get("warum"):
+                        line += f" (Warum: {aktueller_test['warum']})"
                 meilensteine = normalize_meilensteine(data.get("meilensteine"))
                 if meilensteine:
                     m_text = "; ".join(
-                        f"{m.get('text','')}"
+                        f"{m.get('text','')} [{m.get('status','offen')}]"
                         + (f" ({m['datum']})" if m.get("datum") else "")
                         + (f" [Messgrösse: {m['messgroesse']}]" if m.get("messgroesse") else "")
                         for m in meilensteine
                     )
-                    line += f" (Meilensteine: {m_text})"
+                    line += f" | Meilensteine: {m_text}"
                 umsatz = normalize_umsatz(data.get("umsatz"))
                 if umsatz:
                     gesamt = sum(u.get("betrag", 0) for u in umsatz)
@@ -2213,6 +2220,93 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
         run_write(
             conn,
             "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'daily_focus', ?, FALSE, ?)",
+            (user["user_id"], json.dumps(result, ensure_ascii=False), now_iso()),
+        )
+        return result
+
+
+WEEKLY_FOCUS_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person öffnet ihre Wochen-Übersicht \
+und braucht eine begründete Auswahl: welche DREI Aufgaben bringen sie diese Woche wirklich weiter?
+
+WICHTIG - so wählst du aus, in dieser Reihenfolge: Compass (welches Standbein hat gerade Priorität) \
+→ Standbein (welcher Test läuft dort gerade) → Tasks (welche der unten aufgeführten Aufgaben gehören \
+zu genau diesem Test). Bevorzuge Aufgaben, die zum PRIMARY-Standbein und dessen aktuellem Test \
+gehören, gegenüber Aufgaben ohne erkennbaren strategischen Bezug - auch wenn andere Aufgaben \
+dringender wirken. Reine Fälligkeit ist zweitrangig gegenüber strategischer Relevanz.
+
+Du bekommst unten den bekannten Kontext (Profil, Vision, Standbeine mit Phase/Fokus/aktuellem Test) \
+sowie alle offenen Aufgaben mit Fälligkeit diese Woche. Antworte NUR als JSON:
+{
+  "einordnung": "1 Satz, ob die Aufgaben-Auswahl zum aktuellen Fokus passt oder nicht - z.B. 'Deine Woche passt zu deinem aktuellen Fokus.' oder 'Ein Grossteil deiner Aufgaben hat aktuell keinen klaren Bezug zu deiner Priorität.'",
+  "task_texts": ["EXAKT der Titel einer offenen Aufgabe", "zweite Aufgabe", "dritte Aufgabe"]
+}
+"task_texts": maximal 3 Einträge, jeder muss EXAKT (Zeichen für Zeichen) einem unten aufgeführten \
+Aufgaben-Titel entsprechen, sonst weglassen - nichts erfinden. Weniger als 3 sind völlig in Ordnung, \
+wenn nicht genug strategisch relevante Aufgaben vorhanden sind."""
+
+
+@app.get("/tasks/weekly-focus")
+async def get_weekly_focus(user: dict = Depends(get_current_user)):
+    """Wie der tägliche Fokus, aber für die Woche und mit der Compass→Standbein→
+    Test→Tasks-Kette als Auswahlkriterium, nicht nur Fälligkeit. Einmal pro
+    Kalenderwoche generiert, danach wiederverwendet."""
+    import json
+
+    heute = datetime.now(timezone.utc).date()
+    wochenstart = heute - timedelta(days=heute.weekday())
+    wochenende = wochenstart + timedelta(days=6)
+    woche_key = wochenstart.isoformat()
+
+    with get_db() as conn:
+        bestehende = fetch_entries(conn, user["user_id"], "weekly_focus", limit=5)
+        for entry in bestehende:
+            try:
+                data = json.loads(entry["content"])
+                if data.get("week") == woche_key:
+                    return data
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        alle_tasks = fetch_entries(conn, user["user_id"], "task", limit=300)
+        wochen_tasks = [
+            t for t in alle_tasks
+            if t.get("due_date") and wochenstart.isoformat() <= t["due_date"] <= wochenende.isoformat()
+            and t.get("status", "open") == "open"
+        ]
+
+        result_base = {"week": woche_key, "weekStart": wochenstart.isoformat(), "weekEnd": wochenende.isoformat()}
+
+        if not wochen_tasks:
+            result = {**result_base, "einordnung": "", "taskIds": []}
+            run_write(
+                conn,
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'weekly_focus', ?, FALSE, ?)",
+                (user["user_id"], json.dumps(result, ensure_ascii=False), now_iso()),
+            )
+            return result
+
+        memory = build_memory_context(conn, user["user_id"])
+        aufgaben_liste = "\n".join(f"- {t['content']}" for t in wochen_tasks)
+        kontext = f"{memory}\n\n--- Offene Aufgaben mit Fälligkeit diese Woche ---\n{aufgaben_liste}"
+
+        raw = await call_claude(WEEKLY_FOCUS_SYSTEM_PROMPT, [{"role": "user", "content": kontext}])
+        try:
+            parsed = extract_json_object(raw)
+            task_texts = parsed.get("task_texts", [])
+            einordnung = parsed.get("einordnung", "")
+        except (json.JSONDecodeError, AttributeError):
+            task_texts, einordnung = [], ""
+
+        task_ids = []
+        for text in task_texts[:3]:
+            passende = next((t for t in wochen_tasks if t["content"] == text), None)
+            if passende:
+                task_ids.append(passende["id"])
+
+        result = {**result_base, "einordnung": einordnung, "taskIds": task_ids}
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'weekly_focus', ?, FALSE, ?)",
             (user["user_id"], json.dumps(result, ensure_ascii=False), now_iso()),
         )
         return result
