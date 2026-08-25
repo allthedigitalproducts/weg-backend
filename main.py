@@ -720,6 +720,10 @@ wenn im normalen Gesprächsfluss klar erkennbar über ein bestehendes oder neues
 wird, trag es ein, auch wenn die Person es nicht extra als "das ist jetzt mein Standbein" ankündigt. \
 Bei den meisten Nachrichten bleibt "standbein_update" trotzdem leer/null, wenn schlicht kein \
 Standbein-Thema vorkommt.
+- "vision" VS. "card_begruendung": "vision" ist der ausführlichere Text für die Standbein-Detailseite \
+(darf Zahlen, Preise, Pakete, Details enthalten). "card_begruendung" ist NUR der kurze Satz für die \
+Compass-Übersichtskarte (wenig Platz, keine Zahlen/Details) - beide Felder unabhängig voneinander \
+befüllen, nicht denselben Text in beide kopieren.
 - MEILENSTEIN AUCH EIGENSTÄNDIG VORSCHLAGEN DÜRFEN: du musst nicht auf eine grosse Standbein-Änderung \
 warten, um einen Meilenstein vorzuschlagen. Wenn für ein BEREITS BEKANNTES Standbein aus dem Gespräch \
 ein sinnvoller nächster Meilenstein erkennbar wird (auch wenn sich sonst nichts am Standbein ändert), \
@@ -890,6 +894,7 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
     "annahmen": ["Liste kurzer Annahmen, die gerade gemacht werden, aber noch nicht bewiesen sind - optional"],
     "entscheidungsbaum": {"wenn_bestaetigt": "was passiert, wenn der Test positiv ausfällt", "wenn_unklar": "...", "wenn_negativ": "..."},
     "zeithorizont": "z.B. '6-8 Wochen' - nur wenn aus dem Gespräch erkennbar, sonst weglassen",
+    "card_begruendung": "EIN kurzer Satz (max. ca. 12 Wörter), warum dieses Standbein gerade diese Priorität hat - erscheint auf der Compass-Übersichtskarte, wo wenig Platz ist. Keine Zahlen/Preise/Pakete hier - die gehören auf die Standbein-Seite, nicht in 'vision'.",
     "meilensteine": [
       {"text": "konkreter nächster Test", "datum": "2026-08-25 oder null", "messgroesse": "optional", "warum": "kurz, warum genau dieser Test - optional"}
     ]
@@ -1495,11 +1500,14 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             v_data["entscheidungsbaum"] = standbein_update["entscheidungsbaum"]
         if standbein_update.get("zeithorizont"):
             v_data["zeithorizont"] = standbein_update["zeithorizont"]
+        if standbein_update.get("card_begruendung"):
+            v_data["card_begruendung"] = standbein_update["card_begruendung"]
         bestehende_meilensteine = normalize_meilensteine(v_data.get("meilensteine"))
         bestehende_texte = {m.get("text", "").strip().lower() for m in bestehende_meilensteine}
         for m in neue_meilensteine:
             if isinstance(m, dict) and m.get("text", "").strip().lower() not in bestehende_texte:
                 bestehende_meilensteine.append({
+                    "id": secrets.token_hex(4),
                     "text": m.get("text", ""),
                     "datum": m.get("datum"),
                     "erledigt": False,
@@ -1524,9 +1532,11 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             "annahmen": standbein_update.get("annahmen", []),
             "entscheidungsbaum": standbein_update.get("entscheidungsbaum", {}),
             "zeithorizont": standbein_update.get("zeithorizont", ""),
+            "card_begruendung": standbein_update.get("card_begruendung", ""),
             "umsatz": [],
             "meilensteine": [
                 {
+                    "id": secrets.token_hex(4),
                     "text": m.get("text", ""),
                     "datum": m.get("datum"),
                     "erledigt": False,
@@ -2393,6 +2403,7 @@ class VentureIn(BaseModel):
     entscheidungsbaum: dict = {}
     notizen: str = ""
     zeithorizont: str = ""
+    card_begruendung: str = ""
 
 
 def normalize_meilensteine(raw) -> list:
@@ -2411,6 +2422,8 @@ def normalize_meilensteine(raw) -> list:
                     m["messgroesse"] = ""
                 if "warum" not in m:
                     m["warum"] = ""
+                if "id" not in m:
+                    m["id"] = secrets.token_hex(4)
         return raw
     return []
 
