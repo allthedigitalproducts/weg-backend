@@ -1479,6 +1479,31 @@ async def chat_start(payload: ChatStartIn, user: dict = Depends(get_current_user
     return {"answer": antwort}
 
 
+TAGES_KAPAZITAET_MINUTEN = 240  # Angenommene realistische Kapazität für fokussierte Arbeit pro Tag -
+# eine bewusste Annahme, keine vom User konfigurierbare Einstellung. 4 Stunden, nicht 8, weil ein
+# Tag auch aus Terminen/Pausen/Unvorhergesehenem besteht - lieber realistisch knapp als beschönigt voll.
+
+
+def find_capacity_slot(conn, user_id: int, dauer_minuten: int, ab_datum: str) -> str:
+    """Findet den nächsten Tag (ab heute, max. 7 Tage voraus) an dem die geschätzte
+    Aufgaben-Dauer noch in die Tages-Kapazität passt. Wenn kein Tag innerhalb der
+    Woche Platz hat, wird der am wenigsten ausgelastete Tag zurückgegeben - lieber
+    ein realistischer Kompromiss als eine Aufgabe, die nirgendwo passt."""
+    alle_tasks = fetch_entries(conn, user_id, "task", limit=300)
+    offene_tasks = [t for t in alle_tasks if t.get("status", "open") == "open" and t.get("due_date")]
+
+    start = datetime.fromisoformat(ab_datum).date()
+    beste_datum, beste_auslastung = None, None
+    for i in range(7):
+        tag = (start + timedelta(days=i)).isoformat()
+        auslastung = sum(t.get("estimated_minutes") or 0 for t in offene_tasks if t.get("due_date") == tag)
+        if auslastung + dauer_minuten <= TAGES_KAPAZITAET_MINUTEN:
+            return tag
+        if beste_auslastung is None or auslastung < beste_auslastung:
+            beste_datum, beste_auslastung = tag, auslastung
+    return beste_datum
+
+
 def resolve_standbein_reference(conn, user_id: int, standbein_name: Optional[str]) -> tuple:
     """Löst einen Standbein-Namen (wie Sole ihn im Gespräch nennt) zu
     (venture_id, aktueller_test_id) auf - damit von Sole erstellte Tasks
@@ -2160,20 +2185,24 @@ Test/aktuellem Stand) sowie alle offenen Aufgaben. Antworte NUR als JSON, ohne z
 {
   "headline": "kurzer, klarer Satz mit Haltung, z.B. 'Heute würde ich Consulting vorziehen.'",
   "reasoning": "1-3 Sätze Begründung, warum genau das gerade zählt - konkret, nicht generisch. Hebe die wichtigste Kernaussage mit **doppelten Sternchen** hervor, z.B. 'Dein nächster Meilenstein ist der **erste zahlende Kunde**.'",
-  "task_text": "EXAKT der Titel einer der unten aufgeführten offenen Aufgaben, die am besten zu deiner Empfehlung passt, oder null falls keine passt"
+  "empfehlung_text": "die konkrete Handlung, die du empfiehlst - EXAKT der Titel einer unten aufgeführten offenen Aufgabe, ODER ein neuer, noch nicht existierender konkreter nächster Schritt, wenn keine bestehende Aufgabe passt",
+  "ist_neue_aufgabe": true wenn "empfehlung_text" NICHT einem bestehenden Aufgaben-Titel entspricht, sonst false,
+  "dauer_minuten": realistische Schätzung in Minuten (nur relevant, wenn ist_neue_aufgabe true - z.B. 30, 45, 60),
+  "standbein_name": "Name des betroffenen Standbeins, falls die Empfehlung zu einem gehört - sonst null"
 }
 
 WICHTIG - GIB IMMER EINE ECHTE EMPFEHLUNG, KEINE RÜCKFRAGE: Nutze die Kette Compass (welches \
 Standbein hat gerade Priorität) → Standbein (welcher Test/aktueller Stand) → Aufgaben, um eine \
-konkrete Einschätzung zu bilden - auch wenn keine Aufgabe exakt für heute fällig ist. Wenn es offene \
-Aufgaben gibt, die zum Primary-Standbein oder dessen aktuellem Test gehören, empfiehl eine davon, \
-auch wenn sie für später geplant war. Eine Rückfrage statt einer Empfehlung ist NUR die absolute \
-Ausnahme, wenn wirklich gar keine offenen Aufgaben existieren UND keine Standbein-Priorität erkennbar \
-ist - dann "headline": "Bevor ich dir etwas empfehle:" und "reasoning": eine gezielte Rückfrage. In \
-allen anderen Fällen: eine echte, begründete Empfehlung, so wie ein Mentor sie am Morgen geben würde.
+konkrete Einschätzung zu bilden - auch wenn keine passende Aufgabe existiert. Wenn nichts Passendes \
+in der Aufgabenliste steht, aber aus dem aktuellen Test/Stand eines Standbeins ein sinnvoller \
+nächster Schritt hervorgeht, empfiehl DIESEN als neue Aufgabe (ist_neue_aufgabe: true) - das ist \
+ausdrücklich erwünscht, nicht nur eine Notlösung. Eine Rückfrage statt einer Empfehlung ist NUR die \
+absolute Ausnahme, wenn wirklich weder offene Aufgaben noch eine erkennbare Standbein-Priorität \
+existieren - dann "headline": "Bevor ich dir etwas empfehle:" und "reasoning": eine gezielte \
+Rückfrage, alle anderen Felder null/false.
 
-"task_text" muss EXAKT (Zeichen für Zeichen) einem der unten aufgeführten Aufgaben-Titel entsprechen, \
-sonst null - erfinde keinen Titel."""
+"empfehlung_text" muss bei ist_neue_aufgabe:false EXAKT (Zeichen für Zeichen) einem der unten \
+aufgeführten Aufgaben-Titel entsprechen, sonst ist_neue_aufgabe:true setzen."""
 
 
 @app.get("/dashboard/focus")
@@ -2194,6 +2223,7 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
             try:
                 data = json.loads(entry["content"])
                 if data.get("date") == heute:
+                    data["entryId"] = entry["id"]
                     return data
             except (json.JSONDecodeError, TypeError):
                 continue
@@ -2222,7 +2252,8 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
         except (json.JSONDecodeError, AttributeError):
             return None
 
-        passende_task = next((t for t in offene_tasks if t["content"] == parsed.get("task_text")), None)
+        passende_task = next((t for t in offene_tasks if t["content"] == parsed.get("empfehlung_text")), None)
+        ist_neu = parsed.get("ist_neue_aufgabe", False) and not passende_task
 
         result = {
             "date": heute,
@@ -2230,13 +2261,168 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
             "reasoning": parsed.get("reasoning", ""),
             "taskId": passende_task["id"] if passende_task else None,
             "accepted": None,
+            "empfehlungText": parsed.get("empfehlung_text") if ist_neu else None,
+            "istNeueAufgabe": ist_neu,
+            "dauerMinuten": parsed.get("dauer_minuten") if ist_neu else None,
+            "standbeinName": parsed.get("standbein_name"),
         }
-        run_write(
+        neuer_eintrag_id = run_write(
             conn,
             "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'daily_focus', ?, FALSE, ?)",
             (user["user_id"], json.dumps(result, ensure_ascii=False), now_iso()),
         )
+        result["entryId"] = neuer_eintrag_id
         return result
+
+
+@app.post("/dashboard/focus/accept")
+async def accept_daily_focus(user: dict = Depends(get_current_user)):
+    """Macht 'Fokus übernehmen' zu einer echten Handlung, nicht nur einem Flag:
+    - Falls die Empfehlung bereits eine bestehende Aufgabe war: die wird für heute
+      (oder den nächsten Tag mit Kapazität) eingeplant.
+    - Falls die Empfehlung neu war (kein bestehender Task): eine echte Aufgabe wird
+      angelegt, verknüpft mit Standbein + aktuellem Test, mit geschätzter Dauer.
+    In beiden Fällen wird die Kapazitäts-Prüfung genutzt (siehe find_capacity_slot),
+    keine feste "immer heute"-Annahme."""
+    import json
+
+    heute = datetime.now(timezone.utc).date().isoformat()
+
+    with get_db() as conn:
+        bestehende = fetch_entries(conn, user["user_id"], "daily_focus", limit=5)
+        eintrag = None
+        for entry in bestehende:
+            try:
+                data = json.loads(entry["content"])
+                if data.get("date") == heute:
+                    eintrag = (entry["id"], data)
+                    break
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        if not eintrag:
+            raise HTTPException(status_code=404, detail="Kein heutiger Fokus vorhanden.")
+
+        entry_id, data = eintrag
+        task_id = data.get("taskId")
+
+        if task_id:
+            # Bestehende Aufgabe - für den nächsten Tag mit Kapazität einplanen,
+            # statt sie unverändert zu lassen (sie könnte weit in der Zukunft
+            # geplant gewesen sein).
+            dauer = None
+            rows = run_query(conn, "SELECT estimated_minutes FROM entries WHERE id = ? AND user_id = ?", (task_id, user["user_id"]))
+            if rows:
+                dauer = rows[0].get("estimated_minutes") or 30
+            ziel_datum = find_capacity_slot(conn, user["user_id"], dauer or 30, heute)
+            run_write(
+                conn,
+                "UPDATE entries SET due_date = ? WHERE id = ? AND user_id = ?",
+                (ziel_datum, task_id, user["user_id"]),
+            )
+        elif data.get("istNeueAufgabe") and data.get("empfehlungText"):
+            # Neue Empfehlung - Aufgabe jetzt tatsächlich anlegen, verknüpft mit
+            # Standbein + aktuellem Test, mit Kapazitäts-geprüftem Datum.
+            venture_id, test_id = resolve_standbein_reference(conn, user["user_id"], data.get("standbeinName"))
+            dauer = data.get("dauerMinuten") or 30
+            ziel_datum = find_capacity_slot(conn, user["user_id"], dauer, heute)
+            neue_task_id = run_write(
+                conn,
+                """INSERT INTO entries (user_id, type, content, done, due_date, estimated_minutes, venture_id, test_id, source, created_at)
+                   VALUES (?, 'task', ?, FALSE, ?, ?, ?, ?, 'sole_fokus', ?)""",
+                (user["user_id"], data["empfehlungText"], ziel_datum, dauer, venture_id, test_id, now_iso()),
+            )
+            task_id = neue_task_id
+            data["taskId"] = task_id
+        else:
+            raise HTTPException(status_code=400, detail="Keine Empfehlung zum Übernehmen vorhanden.")
+
+        data["accepted"] = True
+        run_write(
+            conn,
+            "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
+            (json.dumps(data, ensure_ascii=False), entry_id, user["user_id"]),
+        )
+        data["entryId"] = entry_id
+        return data
+
+
+NEXT_STEP_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person hat gerade eine Aufgabe erledigt, \
+die vorher deine eigene Tages-Empfehlung war. Das ist ein guter Moment, aktiv den nächsten sinnvollen \
+Schritt vorzuschlagen - nicht abwarten, bis die Person selbst fragt.
+
+Du bekommst unten den Kontext (Profil, Vision, Standbeine, das betroffene Standbein inkl. aktuellem \
+Test/Meilenstein) sowie den Titel der gerade erledigten Aufgabe. Antworte NUR als JSON:
+{
+  "text": "kurzer, warmer Satz, der die Erledigung anerkennt UND den nächsten Schritt konkret benennt - z.B. 'Kontakte identifiziert. Als Nächstes würde ich sie anschreiben.'",
+  "vorschlag_text": "die konkrete nächste Aufgabe, kurz und handlungsorientiert",
+  "dauer_minuten": realistische Schätzung in Minuten
+}
+Nur EINEN nächsten Schritt vorschlagen, nicht mehrere - das hier ist die Fortsetzung eines Fokus, \
+keine neue Aufgabenliste. Wenn nach der erledigten Aufgabe kein sinnvoller nächster Schritt aus dem \
+Kontext hervorgeht (z.B. weil der Test/das Standbein jetzt eine echte Entscheidung braucht statt \
+einer weiteren Aktivität), sag das ehrlich statt einen Schritt zu erfinden: "vorschlag_text": null \
+und "text" benennt, worüber jetzt eigentlich entschieden werden müsste."""
+
+
+@app.get("/dashboard/next-step")
+async def get_next_step_suggestion(completed_task_id: int, user: dict = Depends(get_current_user)):
+    """Der Folge-Schritt-Loop: wird gezielt aufgerufen, wenn die Person genau die
+    Aufgabe erledigt, die Soles Tages-Empfehlung war (nicht bei jeder beliebigen
+    Aufgabe - sonst wäre das nervig statt hilfreich). Kein Caching, da das ein
+    seltenes, gezieltes Ereignis ist, kein wiederholter Seitenaufruf."""
+    import json
+
+    with get_db() as conn:
+        rows = run_query(
+            conn, "SELECT * FROM entries WHERE id = ? AND user_id = ?", (completed_task_id, user["user_id"])
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
+        erledigte_task = rows[0]
+
+        memory = build_memory_context(conn, user["user_id"])
+        kontext = f"{memory}\n\n--- Gerade erledigte Aufgabe ---\n{erledigte_task['content']}"
+
+        raw = await call_claude(NEXT_STEP_SYSTEM_PROMPT, [{"role": "user", "content": kontext}])
+        try:
+            parsed = extract_json_object(raw)
+        except (json.JSONDecodeError, AttributeError):
+            return {"text": "", "vorschlag_text": None, "dauer_minuten": None}
+
+        return {
+            "text": parsed.get("text", ""),
+            "vorschlag_text": parsed.get("vorschlag_text"),
+            "dauer_minuten": parsed.get("dauer_minuten"),
+            "venture_id": erledigte_task.get("venture_id"),
+            "test_id": erledigte_task.get("test_id"),
+        }
+
+
+class NextStepAcceptIn(BaseModel):
+    vorschlag_text: str
+    dauer_minuten: Optional[int] = None
+    venture_id: Optional[int] = None
+    test_id: Optional[str] = None
+
+
+@app.post("/dashboard/next-step/accept")
+def accept_next_step(body: NextStepAcceptIn, user: dict = Depends(get_current_user)):
+    """Legt den vorgeschlagenen nächsten Schritt als echte, verknüpfte Aufgabe an -
+    mit Kapazitäts-Prüfung, genau wie beim regulären Fokus übernehmen."""
+    import json
+
+    heute = datetime.now(timezone.utc).date().isoformat()
+    with get_db() as conn:
+        dauer = body.dauer_minuten or 30
+        ziel_datum = find_capacity_slot(conn, user["user_id"], dauer, heute)
+        neue_task_id = run_write(
+            conn,
+            """INSERT INTO entries (user_id, type, content, done, due_date, estimated_minutes, venture_id, test_id, source, created_at)
+               VALUES (?, 'task', ?, FALSE, ?, ?, ?, ?, 'sole_fokus', ?)""",
+            (user["user_id"], body.vorschlag_text, ziel_datum, dauer, body.venture_id, body.test_id, now_iso()),
+        )
+        return {"taskId": neue_task_id, "dueDate": ziel_datum}
 
 
 WEEKLY_FOCUS_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person öffnet ihre Wochen-Übersicht \
