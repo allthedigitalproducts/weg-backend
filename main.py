@@ -28,6 +28,7 @@ import re
 import secrets
 import sqlite3
 import logging
+import json
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -294,6 +295,25 @@ def now_iso() -> str:
 
 WOCHENTAGE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
 MONATSNAMEN = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"]
+
+
+def extract_json_object(raw: str) -> dict:
+    """Robuster als ein reines removeprefix("```json") - das klappt nur, wenn
+    die Antwort GENAU mit den Backticks beginnt. Manchmal schreibt das Modell
+    trotz Anweisung noch einen Satz VOR das JSON (z.B. "Hier ist mein
+    Vorschlag:\n```json\n{...}"). Deshalb: erst den einfachen Fall probieren,
+    dann als Fallback das erste { bis zum letzten } im Text herausschneiden -
+    deckt beide Fälle ab, wirft json.JSONDecodeError, wenn wirklich kein
+    gültiges JSON drin ist."""
+    cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(raw[start : end + 1])
 
 
 def build_messages_with_date_markers(previous_turns: list) -> list:
@@ -849,7 +869,7 @@ Im Zweifel also lieber einen Vorschlag machen (die Person kann ihn ablehnen), al
 zu sein und am Ende eines langen, inhaltlich reichen Gesprächs bei allen vier Feldern durchgehend \
 leer zu bleiben.
 
-Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
+Antworte AUSSCHLIESSLICH als JSON in diesem Format - KEIN Text davor, KEIN Text danach, KEINE Erklärung, was du gerade tust oder warum. Deine allererste Zeile muss direkt mit "{" beginnen, deine allerletzte Zeile muss mit "}" enden - nichts ausserhalb davon:
 {
   "antwort": "deine eigentliche Chat-Antwort als Sparring-Partner, kann Markdown enthalten (**fett**, > Zitate)",
   "neue_aufgaben": [
@@ -976,7 +996,7 @@ Synthese ergeben (z.B. "Fractional CoS wirtschaftlich validieren").
 
 Halte den Ton warm, persönlich, aber zielgerichtet - das ist ein Kennenlernen, kein Verhör.
 
-Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
+Antworte AUSSCHLIESSLICH als JSON in diesem Format - KEIN Text davor, KEIN Text danach, KEINE Erklärung, was du gerade tust oder warum. Deine allererste Zeile muss direkt mit "{" beginnen, deine allerletzte Zeile muss mit "}" enden - nichts ausserhalb davon:
 {
   "antwort": "deine Frage oder Zusammenfassung, kann Markdown enthalten",
   "neue_aufgaben": [],
@@ -1023,7 +1043,7 @@ und aktualisiere NUR die tatsächlich betroffenen Profil-Felder über "profil" -
 Felder angeben, der Rest bleibt automatisch erhalten. Falls sich nichts Wesentliches geändert hat, \
 ist das ein völlig normales Ergebnis - dann bleibt "profil": null.
 
-Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
+Antworte AUSSCHLIESSLICH als JSON in diesem Format - KEIN Text davor, KEIN Text danach, KEINE Erklärung, was du gerade tust oder warum. Deine allererste Zeile muss direkt mit "{" beginnen, deine allerletzte Zeile muss mit "}" enden - nichts ausserhalb davon:
 {
   "antwort": "deine Frage oder Zusammenfassung, kann Markdown enthalten",
   "neue_aufgaben": [],
@@ -1392,8 +1412,7 @@ async def chat_start(payload: ChatStartIn, user: dict = Depends(get_current_user
     raw = await call_claude(system_prompt, [{"role": "user", "content": kickoff}])
 
     try:
-        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        parsed = json.loads(cleaned)
+        parsed = extract_json_object(raw)
         antwort = parsed.get("antwort", raw)
     except (json.JSONDecodeError, AttributeError):
         antwort = raw
@@ -1632,8 +1651,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     raw = await call_claude(system_prompt, messages)
 
     try:
-        cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        parsed = json.loads(cleaned)
+        parsed = extract_json_object(raw)
         antwort = parsed.get("antwort", raw)
         neue_aufgaben = parsed.get("neue_aufgaben", [])
         neues_profil = parsed.get("profil")
@@ -2071,8 +2089,7 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
 
         raw = await call_claude(DAILY_FOCUS_SYSTEM_PROMPT, [{"role": "user", "content": kontext}])
         try:
-            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            parsed = json.loads(cleaned)
+            parsed = extract_json_object(raw)
         except (json.JSONDecodeError, AttributeError):
             return None
 
@@ -2190,8 +2207,7 @@ async def check_compass(user: dict = Depends(get_current_user)):
         kontext = "\n\n".join(venture_kontext)
         raw = await call_claude(COMPASS_CHECK_PROMPT, [{"role": "user", "content": kontext}])
         try:
-            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            parsed = json.loads(cleaned)
+            parsed = extract_json_object(raw)
             mismatches = parsed.get("mismatches", [])
         except (json.JSONDecodeError, AttributeError):
             mismatches = []
