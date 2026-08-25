@@ -1484,13 +1484,21 @@ TAGES_KAPAZITAET_MINUTEN = 240  # Angenommene realistische Kapazität für fokus
 # Tag auch aus Terminen/Pausen/Unvorhergesehenem besteht - lieber realistisch knapp als beschönigt voll.
 
 
-def find_capacity_slot(conn, user_id: int, dauer_minuten: int, ab_datum: str) -> str:
+def find_capacity_slot(conn, user_id: int, dauer_minuten: int, ab_datum: str, exclude_task_id: Optional[int] = None) -> str:
     """Findet den nächsten Tag (ab heute, max. 7 Tage voraus) an dem die geschätzte
     Aufgaben-Dauer noch in die Tages-Kapazität passt. Wenn kein Tag innerhalb der
     Woche Platz hat, wird der am wenigsten ausgelastete Tag zurückgegeben - lieber
-    ein realistischer Kompromiss als eine Aufgabe, die nirgendwo passt."""
+    ein realistischer Kompromiss als eine Aufgabe, die nirgendwo passt.
+
+    exclude_task_id: beim UMPLANEN einer bereits terminierten Aufgabe darf sie
+    nicht gegen ihr eigenes, noch nicht aktualisiertes altes Datum zählen -
+    sonst würde ihr bisheriger Tag fälschlich als "schon zu voll" erscheinen,
+    obwohl genau diese Aufgabe gleich woanders hin verschoben wird."""
     alle_tasks = fetch_entries(conn, user_id, "task", limit=300)
-    offene_tasks = [t for t in alle_tasks if t.get("status", "open") == "open" and t.get("due_date")]
+    offene_tasks = [
+        t for t in alle_tasks
+        if t.get("status", "open") == "open" and t.get("due_date") and t["id"] != exclude_task_id
+    ]
 
     start = datetime.fromisoformat(ab_datum).date()
     beste_datum, beste_auslastung = None, None
@@ -1502,6 +1510,52 @@ def find_capacity_slot(conn, user_id: int, dauer_minuten: int, ab_datum: str) ->
         if beste_auslastung is None or auslastung < beste_auslastung:
             beste_datum, beste_auslastung = tag, auslastung
     return beste_datum
+
+
+def resolve_task_strategic_context(conn, user_id: int, task_row: dict) -> dict:
+    """Löst venture_id/test_id/milestone_id einer Aufgabe zu lesbarem Text auf -
+    für Stellen, die WISSEN sollen, worauf eine Aufgabe einzahlt, statt es aus
+    dem Aufgaben-Titel zu erraten. Sucht Tests sowohl im aktuellen Test als
+    auch in test_historie (falls der Test inzwischen gewechselt hat)."""
+    import json
+
+    kontext = {"standbein_name": None, "standbein_ziel": None, "test_text": None, "test_warum": None, "milestone_text": None}
+    venture_id = task_row.get("venture_id")
+    if not venture_id:
+        return kontext
+
+    rows = run_query(conn, "SELECT * FROM entries WHERE id = ? AND user_id = ?", (venture_id, user_id))
+    if not rows:
+        return kontext
+    try:
+        v_data = json.loads(rows[0]["content"])
+    except (json.JSONDecodeError, TypeError):
+        return kontext
+
+    kontext["standbein_name"] = v_data.get("name")
+    kontext["standbein_ziel"] = v_data.get("ziel")
+
+    test_id = task_row.get("test_id")
+    if test_id:
+        aktueller_test = v_data.get("aktueller_test")
+        if isinstance(aktueller_test, dict) and aktueller_test.get("id") == test_id:
+            kontext["test_text"] = aktueller_test.get("text")
+            kontext["test_warum"] = aktueller_test.get("warum")
+        else:
+            for alter_test in v_data.get("test_historie") or []:
+                if alter_test.get("id") == test_id:
+                    kontext["test_text"] = alter_test.get("text")
+                    kontext["test_warum"] = alter_test.get("warum")
+                    break
+
+    milestone_id = task_row.get("milestone_id")
+    if milestone_id:
+        for m in normalize_meilensteine(v_data.get("meilensteine")):
+            if m.get("id") == milestone_id:
+                kontext["milestone_text"] = m.get("text")
+                break
+
+    return kontext
 
 
 def resolve_standbein_reference(conn, user_id: int, standbein_name: Optional[str]) -> tuple:
@@ -1584,14 +1638,21 @@ def create_decision_entry(conn, user_id: int, payload: dict) -> None:
     )
 
 
-def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
+def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> dict:
     """Legt ein neues Standbein an oder merged in ein bestehendes (nach Name).
     Enthält dieselbe Logik, die vorher inline in /chat stand — jetzt auch von
-    /suggestions/confirm wiederverwendbar."""
+    /suggestions/confirm wiederverwendbar.
+
+    Gibt jetzt ein dict zurück statt nur bool: {"success": bool, "orphaned_tasks":
+    [...] oder None}. Wenn ein neuer aktueller Test einen bestehenden ersetzt UND
+    noch offene Aufgaben am ALTEN Test hängen, werden die hier zurückgegeben -
+    damit der Aufrufer eine Klärung anbieten kann (behalten/neu zuordnen/nicht
+    mehr relevant), statt dass die Aufgaben strategisch unsichtbar verwaisen.
+    Analog zur bereits bestehenden Regel beim Parken eines Standbeins."""
     import json
 
     if not (isinstance(standbein_update, dict) and standbein_update.get("name")):
-        return False
+        return {"success": False, "orphaned_tasks": None}
 
     neuer_name = standbein_update["name"].strip().lower()
     bestehende_ventures = fetch_entries(conn, user_id, "venture", limit=50)
@@ -1607,6 +1668,7 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
 
     neue_meilensteine = standbein_update.get("meilensteine", []) or []
     neuer_test = standbein_update.get("aktueller_test")
+    orphaned_tasks = None
 
     if passendes_venture:
         venture_id, v_data = passendes_venture
@@ -1645,7 +1707,24 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
         v_data["meilensteine"] = bestehende_meilensteine
         v_data["umsatz"] = normalize_umsatz(v_data.get("umsatz"))
         if isinstance(neuer_test, dict) and neuer_test.get("text"):
+            alter_test_vor_wechsel = v_data.get("aktueller_test")
+            if isinstance(alter_test_vor_wechsel, dict) and alter_test_vor_wechsel.get("id"):
+                alte_test_id = alter_test_vor_wechsel["id"]
+                offene_verwaiste = [
+                    t for t in fetch_entries(conn, user_id, "task", limit=300)
+                    if t.get("test_id") == alte_test_id and t.get("status", "open") == "open"
+                ]
+                if offene_verwaiste:
+                    orphaned_tasks = {
+                        "venture_name": v_data.get("name", ""),
+                        "old_test_text": alter_test_vor_wechsel.get("text", ""),
+                        "new_test_text": neuer_test.get("text", ""),
+                        "task_ids": [t["id"] for t in offene_verwaiste],
+                        "task_titles": [t["content"] for t in offene_verwaiste],
+                    }
             v_data = _standbein_aktueller_test_setzen(v_data, neuer_test)
+            if orphaned_tasks:
+                orphaned_tasks["new_test_id"] = v_data["aktueller_test"]["id"]
         run_write(
             conn,
             "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
@@ -1686,7 +1765,7 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'venture', ?, FALSE, ?)",
             (user_id, json.dumps(neues_venture, ensure_ascii=False), now_iso()),
         )
-    return True
+    return {"success": True, "orphaned_tasks": orphaned_tasks}
 
 
 def _standbein_aktueller_test_setzen(v_data: dict, neuer_test: dict) -> dict:
@@ -1957,7 +2036,16 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
             if isinstance(notiz_update, str) and notiz_update.strip():
                 create_notiz_entry(conn, user["user_id"], notiz_update)
 
-            standbein_gespeichert = apply_standbein_update(conn, user["user_id"], standbein_update)
+            standbein_ergebnis = apply_standbein_update(conn, user["user_id"], standbein_update)
+            standbein_gespeichert = standbein_ergebnis["success"]
+            if standbein_ergebnis.get("orphaned_tasks"):
+                o = standbein_ergebnis["orphaned_tasks"]
+                create_notiz_entry(
+                    conn, user["user_id"],
+                    f"Der Test bei {o['venture_name']} wurde von '{o['old_test_text']}' auf "
+                    f"'{o['new_test_text']}' geändert. {len(o['task_ids'])} noch offene Aufgabe(n) "
+                    f"hingen am alten Test - sollten geprüft werden, ob sie weiterhin relevant sind."
+                )
 
             if isinstance(profil_update, dict) and profil_update:
                 save_profile_merged(conn, user["user_id"], profil_update)
@@ -2017,13 +2105,15 @@ def confirm_suggestion(body: SuggestionConfirmIn, user: dict = Depends(get_curre
     Wird vom neuen Frontend aufgerufen, wenn auf 'Merken'/'Diese Woche'/
     'Übernehmen' o.ä. geklickt wird."""
     with get_db() as conn:
+        orphaned_tasks = None
         if body.kind in ("task", "sole_task"):
             v_id, t_id = resolve_standbein_reference(conn, user["user_id"], body.payload.get("standbein_name"))
             create_task_entry(conn, user["user_id"], body.payload.get("inhalt", ""), body.payload.get("faellig"), v_id, t_id)
         elif body.kind == "notiz":
             create_notiz_entry(conn, user["user_id"], body.payload.get("text", ""))
         elif body.kind in ("standbein", "milestone"):
-            apply_standbein_update(conn, user["user_id"], body.payload)
+            ergebnis = apply_standbein_update(conn, user["user_id"], body.payload)
+            orphaned_tasks = ergebnis.get("orphaned_tasks")
         elif body.kind == "profil":
             save_profile_merged(conn, user["user_id"], body.payload)
         elif body.kind == "compass_draft":
@@ -2040,7 +2130,38 @@ def confirm_suggestion(body: SuggestionConfirmIn, user: dict = Depends(get_curre
             )
         else:
             raise HTTPException(status_code=400, detail=f"Unbekannte Vorschlagsart: {body.kind}")
-    return {"ok": True}
+    return {"ok": True, "orphaned_tasks": orphaned_tasks}
+
+
+class OrphanedTaskResolveIn(BaseModel):
+    action: str  # "behalten" | "neu_zuordnen" | "nicht_relevant"
+    task_ids: list[int]
+    new_test_id: Optional[str] = None
+
+
+@app.post("/tasks/resolve-orphaned")
+def resolve_orphaned_tasks(body: OrphanedTaskResolveIn, user: dict = Depends(get_current_user)):
+    """Löst die Klärung für Aufgaben auf, die durch einen Testwechsel am alten
+    Test hingen (Briefing: 'nicht automatisch löschen oder umhängen, Sole soll
+    einen Klärungsflow anbieten')."""
+    with get_db() as conn:
+        if body.action == "behalten":
+            return {"ok": True}  # bewusst keine Änderung - Person hat aktiv entschieden, so zu lassen
+        if body.action == "nicht_relevant":
+            for task_id in body.task_ids:
+                run_write(
+                    conn,
+                    "UPDATE entries SET status = 'not-relevant' WHERE id = ? AND user_id = ?",
+                    (task_id, user["user_id"]),
+                )
+        elif body.action == "neu_zuordnen" and body.new_test_id:
+            for task_id in body.task_ids:
+                run_write(
+                    conn,
+                    "UPDATE entries SET test_id = ? WHERE id = ? AND user_id = ?",
+                    (body.new_test_id, task_id, user["user_id"]),
+                )
+        return {"ok": True}
 
 
 @app.get("/hypotheses")
@@ -2314,7 +2435,7 @@ async def accept_daily_focus(user: dict = Depends(get_current_user)):
             rows = run_query(conn, "SELECT estimated_minutes FROM entries WHERE id = ? AND user_id = ?", (task_id, user["user_id"]))
             if rows:
                 dauer = rows[0].get("estimated_minutes") or 30
-            ziel_datum = find_capacity_slot(conn, user["user_id"], dauer or 30, heute)
+            ziel_datum = find_capacity_slot(conn, user["user_id"], dauer or 30, heute, exclude_task_id=task_id)
             run_write(
                 conn,
                 "UPDATE entries SET due_date = ? WHERE id = ? AND user_id = ?",
@@ -2351,8 +2472,12 @@ NEXT_STEP_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person hat gerade e
 die vorher deine eigene Tages-Empfehlung war. Das ist ein guter Moment, aktiv den nächsten sinnvollen \
 Schritt vorzuschlagen - nicht abwarten, bis die Person selbst fragt.
 
-Du bekommst unten den Kontext (Profil, Vision, Standbeine, das betroffene Standbein inkl. aktuellem \
-Test/Meilenstein) sowie den Titel der gerade erledigten Aufgabe. Antworte NUR als JSON:
+WICHTIG: Du bekommst unten NICHT nur allgemeinen Hintergrund, sondern die EXAKTE strategische \
+Einordnung der erledigten Aufgabe (Standbein, aktueller Test, betroffener Meilenstein, falls \
+vorhanden) - das ist die massgebliche Quelle, nicht der reine Aufgaben-Titel. Rate nicht selbst, \
+worauf die Aufgabe einzahlt, wenn es dir explizit genannt wird.
+
+Antworte NUR als JSON:
 {
   "text": "kurzer, warmer Satz, der die Erledigung anerkennt UND den nächsten Schritt konkret benennt - z.B. 'Kontakte identifiziert. Als Nächstes würde ich sie anschreiben.'",
   "vorschlag_text": "die konkrete nächste Aufgabe, kurz und handlungsorientiert",
@@ -2370,7 +2495,12 @@ async def get_next_step_suggestion(completed_task_id: int, user: dict = Depends(
     """Der Folge-Schritt-Loop: wird gezielt aufgerufen, wenn die Person genau die
     Aufgabe erledigt, die Soles Tages-Empfehlung war (nicht bei jeder beliebigen
     Aufgabe - sonst wäre das nervig statt hilfreich). Kein Caching, da das ein
-    seltenes, gezieltes Ereignis ist, kein wiederholter Seitenaufruf."""
+    seltenes, gezieltes Ereignis ist, kein wiederholter Seitenaufruf.
+
+    Nutzt bewusst die vorhandene venture_id/test_id/milestone_id-Verknüpfung
+    der Aufgabe, statt den strategischen Zusammenhang aus dem Gesamtkontext +
+    Aufgaben-Titel erraten zu lassen - das war vorher der Fall und schwächte
+    genau den Moment, der den Unterschied zwischen Tool und Mentor ausmachen soll."""
     import json
 
     with get_db() as conn:
@@ -2381,8 +2511,24 @@ async def get_next_step_suggestion(completed_task_id: int, user: dict = Depends(
             raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
         erledigte_task = rows[0]
 
+        strategischer_kontext = resolve_task_strategic_context(conn, user["user_id"], erledigte_task)
         memory = build_memory_context(conn, user["user_id"])
-        kontext = f"{memory}\n\n--- Gerade erledigte Aufgabe ---\n{erledigte_task['content']}"
+
+        kontext_teile = [memory, f"--- Gerade erledigte Aufgabe ---\n{erledigte_task['content']}"]
+        if strategischer_kontext["standbein_name"]:
+            zeile = f"Gehört zu Standbein: {strategischer_kontext['standbein_name']}"
+            if strategischer_kontext["standbein_ziel"]:
+                zeile += f" (Ziel: {strategischer_kontext['standbein_ziel']})"
+            kontext_teile.append(zeile)
+        if strategischer_kontext["test_text"]:
+            zeile = f"War Teil des Tests: {strategischer_kontext['test_text']}"
+            if strategischer_kontext["test_warum"]:
+                zeile += f" (Warum dieser Test: {strategischer_kontext['test_warum']})"
+            kontext_teile.append(zeile)
+        if strategischer_kontext["milestone_text"]:
+            kontext_teile.append(f"Zahlt ein auf Meilenstein: {strategischer_kontext['milestone_text']}")
+
+        kontext = "\n\n".join(kontext_teile)
 
         raw = await call_claude(NEXT_STEP_SYSTEM_PROMPT, [{"role": "user", "content": kontext}])
         try:
