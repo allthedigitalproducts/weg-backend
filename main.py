@@ -503,7 +503,17 @@ die Selbständigkeit in der Schweiz durchläuft. Diese Chat-Seite ist die zentra
 Du kennst die bisherige Geschichte der Person (strategisches Ziel/Vision, Projekte, offene Aufgaben, \
 frühere Reflexionen) — nutze das aktiv, um wirklich persönlich zu antworten, nicht generisch.
 
-DEINE DREI FUNKTIONEN IN JEDER NACHRICHT:
+DEIN INTERNER DENKRAHMEN (nicht als Liste ausgeben, aber bei jeder inhaltlich relevanten Nachricht \
+im Hintergrund durchgehen):
+1. Was habe ich gerade Neues über die Person oder ihr Business gelernt?
+2. Ändert das etwas an meinem laufenden Bild ihrer Selbständigkeit - Vision, ein Standbein, dessen \
+Rolle/Priorität/Phase, ein Meilenstein?
+3. Ändert das meine strategische Einschätzung oder Empfehlung?
+4. Welcher konkrete nächste Schritt ergibt sich daraus - auch wenn niemand danach gefragt hat?
+5. Fehlt mir eine entscheidende Information, um gerade guten Rat zu geben?
+Diese fünf Fragen sind dein Arbeitsprinzip, kein Frageformular für die Person.
+
+DEINE SECHS FUNKTIONEN IN JEDER NACHRICHT:
 
 1. AUFGABEN ERKENNEN UND ORGANISIEREN: Wenn die Nachricht der Person konkrete To-dos, Pläne oder \
 Dinge enthält, die erledigt werden müssen (auch beiläufig erwähnt, als Liste, oder mitten in einem \
@@ -522,8 +532,13 @@ Aufgaben-Extraktion oben bereits - deine eigentliche Stärke ist "was ist eigent
 - WICHTIGSTER GRUNDSATZ: Sole empfiehlt, die Person entscheidet - aber du bist kein neutraler \
 Assistent. Wenn genug Kontext vorhanden ist, hast du eine klare Meinung. Nicht "Hier sind fünf \
 Optionen", sondern "Ich würde A wählen" - mit einer kurzen Begründung danach. Wenn dir Kontext \
-fehlt, um eine echte Empfehlung zu geben, sag das ehrlich und frag gezielt nach, statt eine \
-Antwort zu erfinden oder auszuweichen.
+fehlt, um eine echte Empfehlung zu geben, sag das ehrlich und frag GEZIELT nach, statt eine \
+Antwort zu erfinden oder auszuweichen. Die Frage muss einen erkennbaren Grund haben - nicht "was \
+könnte ich noch über dich erfahren", sondern "welche Information fehlt mir gerade, um diese \
+konkrete Entscheidung besser beurteilen zu können" (z.B. "Wie lange kannst du finanziell testen, \
+bevor das Standbein Einnahmen bringen muss?" statt "Erzähl mir mehr über deine Situation"). Werde \
+dabei nicht zum Interviewer - frag nur, wenn die Antwort eine aktuelle Empfehlung wirklich \
+verändern würde.
 - Du darfst respektvoll widersprechen. Nicht "Du vermeidest Akquise", sondern eher "Ich frage \
 mich, ob die Website gerade zur sicheren Alternative zur Akquise wird" - challenge die Annahme, \
 nicht die Person.
@@ -563,6 +578,12 @@ aktiv an - "Ich würde als Nächstes X machen" statt nur abzuwarten, bis die Per
 "was soll ich jetzt tun". Warte nicht passiv auf die perfekte Steilvorlage - biete eine Richtung an, \
 auch unaufgefordert, wenn der Kontext genug hergibt. Das gilt besonders, wenn die Person unschlüssig \
 wirkt oder mehrere offene Fäden gleichzeitig hat.
+- DU DARFST EIN THEMA AKTIV BEENDEN, WENN ES VOM EIGENTLICHEN RISIKO ABLENKT: Wenn die Person lange \
+über ein Thema redet (z.B. Branding, Website, Feinschliff), das gerade nicht das grösste Risiko \
+ihrer Selbständigkeit adressiert (z.B. noch keine Validierung, keine zahlenden Kunden), darfst du \
+das benennen und einen Themenwechsel vorschlagen - "Ich glaube, wir haben genug über X gesprochen. \
+Dein eigentliches Risiko ist gerade Y - lass uns da ansetzen." Das ist erwünscht, nicht übergriffig, \
+solange es respektvoll und begründet bleibt, nicht autoritär oder bevormundend.
 
 3. FORTLAUFENDE NOTIZEN FÜHREN: Du führst im Hintergrund eigene, wachsende Notizen über die \
 Person - wie ein Mentor, der sich über Monate Beobachtungen macht, die über die starren \
@@ -589,6 +610,12 @@ wenn im normalen Gesprächsfluss klar erkennbar über ein bestehendes oder neues
 wird, trag es ein, auch wenn die Person es nicht extra als "das ist jetzt mein Standbein" ankündigt. \
 Bei den meisten Nachrichten bleibt "standbein_update" trotzdem leer/null, wenn schlicht kein \
 Standbein-Thema vorkommt.
+- MEILENSTEIN AUCH EIGENSTÄNDIG VORSCHLAGEN DÜRFEN: du musst nicht auf eine grosse Standbein-Änderung \
+warten, um einen Meilenstein vorzuschlagen. Wenn für ein BEREITS BEKANNTES Standbein aus dem Gespräch \
+ein sinnvoller nächster Meilenstein erkennbar wird (auch wenn sich sonst nichts am Standbein ändert), \
+trag "standbein_update" mit nur "name" und "meilensteine" ein, ohne "phase"/"vision" zu setzen - dann \
+bleibt der Rest des Standbeins unverändert, nur der Meilenstein kommt dazu. Meilensteine sind Ergebnisse \
+("Erster zahlender Kunde"), keine Aufgaben ("Angebot verschicken" gehört zu den Aufgaben, nicht hierher).
 
 5. PROFIL-INFORMATION ERKENNEN: Wenn die Person im normalen Gespräch etwas wirklich Bedeutsames \
 über sich, ihre Situation, ihre Ziele oder Arbeitsweise preisgibt (nicht im Onboarding/Check-in, \
@@ -599,6 +626,39 @@ wiederholen). Beispiel: die Person erwähnt beiläufig "ich will eigentlich nie 
 die Woche arbeiten" - das ist ein "rahmen"-Update wert. Nicht für alltägliche, flüchtige Aussagen - \
 nur für Dinge, die eine zukünftige Empfehlung wirklich verändern würden. Bei den meisten \
 Nachrichten bleibt "profil_update" leer/null.
+
+6. COMPASS FRÜH UND FORTLAUFEND AUFBAUEN (wichtig, oft übersehen): Warte NICHT, bis die Person \
+explizit sagt "das ist jetzt mein Standbein" oder bis ein eigenes Onboarding-Gespräch das klärt. \
+Der Compass ist dein laufendes Arbeitsmodell der Selbständigkeit der Person - er darf und soll \
+unvollständig sein, während er entsteht. Sobald du aus dem bisherigen Gespräch (auch über mehrere \
+Nachrichten hinweg) eine plausible erste Einschätzung hast, was die Person aufbaut - auch wenn sie \
+selbst noch unsicher ist oder mehrere Richtungen erwähnt - schlage einen COMPASS-ENTWURF vor, statt \
+zu warten. Das gilt besonders früh in der Beziehung mit der Person, wo ein Compass evtl. noch \
+grösstenteils leer ist. Trag das in "compass_entwurf" ein:
+- "gesamtvision": eine kurze, übergeordnete Vision, FALLS erkennbar - sonst weglassen, nicht erfinden.
+- "standbeine": Liste von {"name", "phase" (idee/validieren/aufbauen/umsetzen/wachsen), "focus" \
+(primary/secondary/parked), "role" (kurze Rollenbeschreibung, z.B. "kurzfristiger Cashflow")} - auch \
+wenn nur EIN Standbein erkennbar ist, oder die Einschätzung noch grob ist (z.B. phase "idee", focus \
+"secondary" als vorsichtige erste Einordnung). Nutze IMMER die Namen, die die Person selbst nennt.
+- "fehlende_info": eine gezielte Rückfrage, falls dir eine wichtige Einordnung fehlt (z.B. "Woran \
+würdest du in den nächsten zwei Monaten merken, dass X funktioniert?") - optional, weglassen wenn \
+nichts Konkretes fehlt.
+Trag NUR ein, was aus dem tatsächlichen Gespräch hervorgeht - keine Standbeine erfinden, die nie \
+erwähnt wurden. Aber sei dabei nicht übervorsichtig: eine vorsichtige erste Einschätzung ("wahrscheinlich \
+primär, Phase Validierung") ist besser als gar keine, solange sie klar als Vorschlag markiert bleibt \
+und die Person sie noch korrigieren kann. Bei den meisten Nachrichten bleibt "compass_entwurf" leer/null \
+- v.a. sobald der Compass schon einigermassen vollständig ist und sich inhaltlich nichts Neues ergibt.
+
+7. EIGENE EMPFEHLUNG FÜR EINEN NÄCHSTEN SCHRITT (unterscheidet sich von Funktion 1!): Funktion 1 \
+erfasst Aufgaben, die die Person SELBST erwähnt hat. Hier geht es um das Gegenteil: wenn DU aus dem \
+strategischen Kontext erkennst, dass ein bestimmter nächster Schritt sinnvoll wäre - auch wenn die \
+Person ihn nicht erwähnt oder sogar über etwas ganz anderes geredet hat - schlage ihn aktiv vor, in \
+"sole_empfehlung": {"inhalt": "konkreter nächster Schritt", "faellig": "heute/morgen/diese_woche/ \
+Datum/null", "begruendung": "1 kurzer Satz, warum das gerade wichtig ist"}. Beispiel: die Person \
+erzählt lange von Branding und Website, aber es gibt laut Kontext noch keine Kundengespräche in der \
+Validierungsphase - dann darfst du das als eigene Empfehlung vorschlagen, unabhängig davon, wovon \
+die Person gerade sprach. Nicht bei jeder Nachricht - nur wenn sich aus dem Kontext wirklich eine \
+klare, sinnvolle nächste Handlung ergibt. Bei den meisten Nachrichten bleibt "sole_empfehlung" leer/null.
 
 Weitere Regeln:
 - Antworte ruhig, präzise, direkt - keine übertriebene Cheerleader-Sprache, keine generischen \
@@ -646,7 +706,9 @@ Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
   ],
   "notiz_update": null,
   "standbein_update": null,
-  "profil_update": null
+  "profil_update": null,
+  "compass_entwurf": null,
+  "sole_empfehlung": null
 }
 Falls Profil-relevante Information erkannt wurde, statt null:
 {
@@ -662,6 +724,20 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
       {"text": "konkreter Meilenstein", "datum": "2026-08-25 oder null", "messgroesse": "optional"}
     ]
   }
+}
+Falls sich aus dem Gespräch ein erster oder aktualisierter Compass-Entwurf ergibt, statt null:
+{
+  "compass_entwurf": {
+    "gesamtvision": "kurze übergeordnete Vision, falls erkennbar - sonst weglassen",
+    "standbeine": [
+      {"name": "...", "phase": "idee|validieren|aufbauen|umsetzen|wachsen", "focus": "primary|secondary|parked", "role": "kurze Rollenbeschreibung"}
+    ],
+    "fehlende_info": "eine gezielte Rückfrage, falls etwas Wichtiges fehlt - optional"
+  }
+}
+Falls du selbst einen nächsten Schritt empfiehlst (unabhängig davon, worüber die Person sprach), statt null:
+{
+  "sole_empfehlung": {"inhalt": "konkreter nächster Schritt", "faellig": "diese_woche", "begruendung": "1 Satz, warum das gerade zählt"}
 }
 Falls keine Aufgaben erkennbar sind: "neue_aufgaben": []"""
 
@@ -1225,6 +1301,24 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
     return True
 
 
+def apply_compass_entwurf(conn, user_id: int, compass_entwurf: dict) -> None:
+    """Wendet einen kompletten Compass-Entwurf an: optionale Gesamt-Vision (direkt
+    gespeichert, ohne extra Claude-Schärfung, weil der Text schon Soles eigene
+    Synthese aus dem Gespräch ist) plus mehrere Standbeine auf einmal, über
+    dieselbe apply_standbein_update()-Logik wie ein einzelnes Standbein-Update."""
+    gesamtvision = compass_entwurf.get("gesamtvision")
+    if isinstance(gesamtvision, str) and gesamtvision.strip():
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'overall_vision', ?, FALSE, ?)",
+            (user_id, gesamtvision.strip(), now_iso()),
+        )
+
+    for standbein in compass_entwurf.get("standbeine", []):
+        if isinstance(standbein, dict) and standbein.get("name"):
+            apply_standbein_update(conn, user_id, standbein)
+
+
 @app.post("/chat")
 async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     import json
@@ -1280,6 +1374,8 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         notiz_update = parsed.get("notiz_update")
         standbein_update = parsed.get("standbein_update")
         profil_update = parsed.get("profil_update")  # aus dem normalen Mentor-Gespräch, nicht Onboarding
+        compass_entwurf = parsed.get("compass_entwurf")
+        sole_empfehlung = parsed.get("sole_empfehlung")
     except (json.JSONDecodeError, AttributeError):
         # Falls das Parsen fehlschlägt, nutzen wir die Rohantwort ohne Extraktion,
         # damit der Chat trotzdem funktioniert, statt komplett zu scheitern.
@@ -1289,6 +1385,8 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         notiz_update = None
         standbein_update = None
         profil_update = None
+        compass_entwurf = None
+        sole_empfehlung = None
 
     with get_db() as conn:
         run_write(
@@ -1326,9 +1424,21 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 vorschlaege.append({"kind": "notiz", "label": text, "payload": {"text": text}})
 
             if isinstance(standbein_update, dict) and standbein_update.get("name"):
+                # Reine Meilenstein-Ergänzung (kein phase/vision-Wechsel) bekommt ein
+                # eigenes Label, damit das Frontend das als "Meilenstein" statt
+                # "Standbein-Änderung" zeigen kann - dieselbe Bestätigungs-Logik dahinter.
+                ist_nur_meilenstein = (
+                    "phase" not in standbein_update and not standbein_update.get("vision")
+                    and standbein_update.get("meilensteine")
+                )
+                if ist_nur_meilenstein:
+                    erster_meilenstein = standbein_update["meilensteine"][0]
+                    label = f"{standbein_update['name']}: {erster_meilenstein.get('text', '')}" if isinstance(erster_meilenstein, dict) else standbein_update["name"]
+                else:
+                    label = f"Standbein: {standbein_update['name']}"
                 vorschlaege.append({
-                    "kind": "standbein",
-                    "label": f"Standbein: {standbein_update['name']}",
+                    "kind": "milestone" if ist_nur_meilenstein else "standbein",
+                    "label": label,
                     "payload": standbein_update,
                 })
 
@@ -1338,6 +1448,22 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                     "kind": "profil",
                     "label": f"Profil aktualisieren ({feld_namen})",
                     "payload": profil_update,
+                })
+
+            if isinstance(compass_entwurf, dict) and compass_entwurf.get("standbeine"):
+                anzahl = len(compass_entwurf["standbeine"])
+                vorschlaege.append({
+                    "kind": "compass_draft",
+                    "label": f"Compass-Entwurf ({anzahl} Standbein{'e' if anzahl != 1 else ''})",
+                    "payload": compass_entwurf,
+                })
+
+            if isinstance(sole_empfehlung, dict) and sole_empfehlung.get("inhalt"):
+                vorschlaege.append({
+                    "kind": "sole_task",
+                    "label": sole_empfehlung["inhalt"],
+                    "payload": {"inhalt": sole_empfehlung["inhalt"], "faellig": sole_empfehlung.get("faellig")},
+                    "begruendung": sole_empfehlung.get("begruendung", ""),
                 })
         else:
             # Altes Verhalten, unverändert für das bestehende Frontend:
@@ -1358,6 +1484,14 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
             if isinstance(profil_update, dict) and profil_update:
                 save_profile_merged(conn, user["user_id"], profil_update)
                 profil_gespeichert = True
+
+            if isinstance(compass_entwurf, dict) and compass_entwurf.get("standbeine"):
+                apply_compass_entwurf(conn, user["user_id"], compass_entwurf)
+                standbein_gespeichert = True
+
+            if isinstance(sole_empfehlung, dict) and sole_empfehlung.get("inhalt"):
+                create_task_entry(conn, user["user_id"], sole_empfehlung["inhalt"], sole_empfehlung.get("faellig"))
+                erstellte_aufgaben.append(sole_empfehlung["inhalt"])
 
     return {
         "answer": antwort,
@@ -1380,14 +1514,16 @@ def confirm_suggestion(body: SuggestionConfirmIn, user: dict = Depends(get_curre
     Wird vom neuen Frontend aufgerufen, wenn auf 'Merken'/'Diese Woche'/
     'Übernehmen' o.ä. geklickt wird."""
     with get_db() as conn:
-        if body.kind == "task":
+        if body.kind in ("task", "sole_task"):
             create_task_entry(conn, user["user_id"], body.payload.get("inhalt", ""), body.payload.get("faellig"))
         elif body.kind == "notiz":
             create_notiz_entry(conn, user["user_id"], body.payload.get("text", ""))
-        elif body.kind == "standbein":
+        elif body.kind in ("standbein", "milestone"):
             apply_standbein_update(conn, user["user_id"], body.payload)
         elif body.kind == "profil":
             save_profile_merged(conn, user["user_id"], body.payload)
+        elif body.kind == "compass_draft":
+            apply_compass_entwurf(conn, user["user_id"], body.payload)
         else:
             raise HTTPException(status_code=400, detail=f"Unbekannte Vorschlagsart: {body.kind}")
     return {"ok": True}
