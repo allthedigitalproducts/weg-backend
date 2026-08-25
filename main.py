@@ -744,6 +744,12 @@ Standbein-Thema vorkommt.
 (darf Zahlen, Preise, Pakete, Details enthalten). "card_begruendung" ist NUR der kurze Satz für die \
 Compass-Übersichtskarte (wenig Platz, keine Zahlen/Details) - beide Felder unabhängig voneinander \
 befüllen, nicht denselben Text in beide kopieren.
+- PRIORITÄT (focus) BEWUSST ÄNDERN, NICHT NEBENBEI: "focus" bestimmt, wie dominant ein Standbein auf \
+dem Compass dargestellt wird (primary = grösste Priorität, secondary = wird weiterverfolgt, parked = \
+bewusst zurückgestellt). Setze das NUR, wenn aus dem Gespräch wirklich eine klare Priorisierungs- \
+Entscheidung hervorgeht (z.B. "lass uns X jetzt zur Priorität machen" oder "Y parken wir erstmal") - \
+nicht bei jedem beiläufigen standbein_update automatisch mitschicken, sonst verliert primary seine \
+Bedeutung. Es sollte in der Regel höchstens EIN Standbein gleichzeitig primary sein.
 - MEILENSTEIN AUCH EIGENSTÄNDIG VORSCHLAGEN DÜRFEN: du musst nicht auf eine grosse Standbein-Änderung \
 warten, um einen Meilenstein vorzuschlagen. Wenn für ein BEREITS BEKANNTES Standbein aus dem Gespräch \
 ein sinnvoller nächster Meilenstein erkennbar wird (auch wenn sich sonst nichts am Standbein ändert), \
@@ -910,6 +916,7 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
     "name": "Name des Standbeins, wie die Person es selbst nennt",
     "vision": "kurze Vision/Zahlen/Ziele, so wie besprochen",
     "phase": "idee | validieren | aufbauen | umsetzen | wachsen (nur falls erkennbar, sonst weglassen)",
+    "focus": "primary | secondary | parked (nur falls sich die Priorität im Gespräch wirklich ändert oder ein neues Standbein entsteht - sonst weglassen, nicht bei jedem Standbein-Update mitschicken)",
     "ziel": "was konkret erreicht werden soll (optional, nur wenn klar unterscheidbar von 'vision')",
     "annahmen": ["Liste kurzer Annahmen, die gerade gemacht werden, aber noch nicht bewiesen sind - optional"],
     "entscheidungsbaum": {"wenn_bestaetigt": "was passiert, wenn der Test positiv ausfällt", "wenn_unklar": "...", "wenn_negativ": "..."},
@@ -1511,6 +1518,8 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             v_data["phase"] = standbein_update["phase"]
         elif v_data.get("phase") not in VENTURE_PHASES:
             v_data["phase"] = "idee"
+        if standbein_update.get("focus") in VENTURE_FOCUS_OPTIONS:
+            v_data["focus"] = standbein_update["focus"]
         if standbein_update.get("ziel"):
             v_data["ziel"] = standbein_update["ziel"]
         if standbein_update.get("annahmen"):
