@@ -726,6 +726,19 @@ ein sinnvoller nächster Meilenstein erkennbar wird (auch wenn sich sonst nichts
 trag "standbein_update" mit nur "name" und "meilensteine" ein, ohne "phase"/"vision" zu setzen - dann \
 bleibt der Rest des Standbeins unverändert, nur der Meilenstein kommt dazu. Meilensteine sind Ergebnisse \
 ("Erster zahlender Kunde"), keine Aufgaben ("Angebot verschicken" gehört zu den Aufgaben, nicht hierher).
+- SPRACHE GEGENÜBER DER PERSON: sprich in "antwort" NICHT von "Meilenstein" oder "Beweis" - nutze \
+"Test" ("dein nächster Test wäre..."). Intern/im JSON heisst das Feld weiterhin "meilensteine", das \
+ist nur ein Datenmodell-Name, keine Vorgabe für deine gesprochene Sprache.
+- WENN DU EINEN TEST VORSCHLÄGST, BEGRÜNDE IHN UND ZEIG DIE KONSEQUENZ: ein guter Test beantwortet \
+nicht nur "was", sondern auch "warum genau das" und "was passiert je nach Ergebnis". Nutze dafür \
+optional "warum" beim Meilenstein-Eintrag, und wenn die Person schon erkennbar unterschiedliche \
+Konsequenzen je nach Testausgang durchdacht hat, trag das in "entscheidungsbaum" ein: \
+{"wenn_bestaetigt": "...", "wenn_unklar": "...", "wenn_negativ": "..."} - nur wenn das wirklich aus \
+dem Gespräch hervorgeht, nicht erfinden.
+- ANNAHMEN FESTHALTEN: wenn im Gespräch klar wird, dass eine Empfehlung auf unbewiesenen Annahmen \
+beruht (z.B. "Unternehmen haben dieses Problem", "sie sind bereit, dafür zu bezahlen") - trag diese \
+kurz und stichpunktartig in "annahmen" ein (Liste). Das macht sichtbar, worauf eine Einschätzung \
+eigentlich beruht, nicht nur das Ergebnis.
 
 5. PROFIL-INFORMATION ERKENNEN: Wenn die Person im normalen Gespräch etwas wirklich Bedeutsames \
 über sich, ihre Situation, ihre Ziele oder Arbeitsweise preisgibt (nicht im Onboarding/Check-in, \
@@ -757,6 +770,12 @@ Trag NUR ein, was aus dem tatsächlichen Gespräch hervorgeht - keine Standbeine
 erwähnt wurden. Aber sei dabei nicht übervorsichtig: eine vorsichtige erste Einschätzung ("wahrscheinlich \
 primär, Phase Validierung") ist besser als gar keine, solange sie klar als Vorschlag markiert bleibt \
 und die Person sie noch korrigieren kann. Bei den meisten Nachrichten bleibt "compass_entwurf" leer/null \
+- ABGRENZUNG ZU "vision_vorschlag": compass_entwurf ist für die ERSTE Einordnung oder das Hinzufügen \
+neuer Standbeine gedacht. Wenn die Person bereits eine gespeicherte übergeordnete Vision hat (siehe \
+Kontext unten) und neue Informationen dieser bestehenden Vision widersprechen oder sie deutlich \
+schärfen würden, nutze stattdessen "vision_vorschlag" (siehe Beispiel im JSON-Format unten) - das \
+macht die Änderung als eigene, klar erkennbare Korrektur sichtbar, statt sie in einem allgemeinen \
+Compass-Entwurf zu verstecken.
 - v.a. sobald der Compass schon einigermassen vollständig ist und sich inhaltlich nichts Neues ergibt.
 
 7. EIGENE EMPFEHLUNG FÜR EINEN NÄCHSTEN SCHRITT (unterscheidet sich von Funktion 1!): Funktion 1 \
@@ -840,7 +859,14 @@ Antworte AUSSCHLIESSLICH als JSON in diesem Format, ohne zusätzlichen Text:
   "compass_entwurf": null,
   "sole_empfehlung": null,
   "hypothese_vorschlag": null,
-  "entscheidung_vorschlag": null
+  "entscheidung_vorschlag": null,
+  "vision_vorschlag": null
+}
+Falls die bestehende übergeordnete Vision/Richtung laut neuen Informationen nicht mehr sauber passt \
+(nicht bei der ERSTEN Vision-Formulierung - dafür ist compass_entwurf da - sondern wenn eine \
+BEREITS BESTEHENDE Vision durch das Gespräch infrage gestellt wird), statt null:
+{
+  "vision_vorschlag": {"text": "neu formulierte oder geschärfte Vision", "begruendung": "was sich geändert hat und warum die neue Formulierung besser passt"}
 }
 Falls sich eine Hypothese ergibt, statt null:
 {
@@ -860,8 +886,11 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
     "name": "Name des Standbeins, wie die Person es selbst nennt",
     "vision": "kurze Vision/Zahlen/Ziele, so wie besprochen",
     "phase": "idee | validieren | aufbauen | umsetzen | wachsen (nur falls erkennbar, sonst weglassen)",
+    "ziel": "was konkret erreicht werden soll (optional, nur wenn klar unterscheidbar von 'vision')",
+    "annahmen": ["Liste kurzer Annahmen, die gerade gemacht werden, aber noch nicht bewiesen sind - optional"],
+    "entscheidungsbaum": {"wenn_bestaetigt": "was passiert, wenn der Test positiv ausfällt", "wenn_unklar": "...", "wenn_negativ": "..."},
     "meilensteine": [
-      {"text": "konkreter Meilenstein", "datum": "2026-08-25 oder null", "messgroesse": "optional"}
+      {"text": "konkreter nächster Test", "datum": "2026-08-25 oder null", "messgroesse": "optional", "warum": "kurz, warum genau dieser Test - optional"}
     ]
   }
 }
@@ -1457,6 +1486,12 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             v_data["phase"] = standbein_update["phase"]
         elif v_data.get("phase") not in VENTURE_PHASES:
             v_data["phase"] = "idee"
+        if standbein_update.get("ziel"):
+            v_data["ziel"] = standbein_update["ziel"]
+        if standbein_update.get("annahmen"):
+            v_data["annahmen"] = standbein_update["annahmen"]
+        if standbein_update.get("entscheidungsbaum"):
+            v_data["entscheidungsbaum"] = standbein_update["entscheidungsbaum"]
         bestehende_meilensteine = normalize_meilensteine(v_data.get("meilensteine"))
         bestehende_texte = {m.get("text", "").strip().lower() for m in bestehende_meilensteine}
         for m in neue_meilensteine:
@@ -1466,6 +1501,7 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
                     "datum": m.get("datum"),
                     "erledigt": False,
                     "messgroesse": m.get("messgroesse", ""),
+                    "warum": m.get("warum", ""),
                 })
         v_data["meilensteine"] = bestehende_meilensteine
         v_data["umsatz"] = normalize_umsatz(v_data.get("umsatz"))
@@ -1481,6 +1517,9 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             "phase": standbein_update.get("phase") if standbein_update.get("phase") in VENTURE_PHASES else "idee",
             "role": standbein_update.get("role", ""),
             "focus": standbein_update.get("focus") if standbein_update.get("focus") in VENTURE_FOCUS_OPTIONS else "secondary",
+            "ziel": standbein_update.get("ziel", ""),
+            "annahmen": standbein_update.get("annahmen", []),
+            "entscheidungsbaum": standbein_update.get("entscheidungsbaum", {}),
             "umsatz": [],
             "meilensteine": [
                 {
@@ -1488,6 +1527,7 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
                     "datum": m.get("datum"),
                     "erledigt": False,
                     "messgroesse": m.get("messgroesse", ""),
+                    "warum": m.get("warum", ""),
                 }
                 for m in neue_meilensteine if isinstance(m, dict)
             ],
@@ -1592,6 +1632,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         entscheidung_vorschlag = parsed.get("entscheidung_vorschlag")
         synthese = parsed.get("synthese")  # nur aus dem Onboarding-Deep-Dive
         was_testen = parsed.get("was_testen")
+        vision_vorschlag = parsed.get("vision_vorschlag")
     except (json.JSONDecodeError, AttributeError):
         # Falls das Parsen fehlschlägt, nutzen wir die Rohantwort ohne Extraktion,
         # damit der Chat trotzdem funktioniert, statt komplett zu scheitern.
@@ -1607,6 +1648,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         entscheidung_vorschlag = None
         synthese = None
         was_testen = None
+        vision_vorschlag = None
 
     # Kern-Antwort IMMER sichern und zurückgeben, auch wenn danach beim
     # Speichern von Aufgaben/Standbein/Profil etwas schiefgeht - eine bereits
@@ -1723,6 +1765,14 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                             "payload": hyp,
                             "begruendung": hyp.get("begruendung", ""),
                         })
+
+            if isinstance(vision_vorschlag, dict) and vision_vorschlag.get("text"):
+                vorschlaege.append({
+                    "kind": "vision",
+                    "label": vision_vorschlag["text"],
+                    "payload": vision_vorschlag,
+                    "begruendung": vision_vorschlag.get("begruendung", ""),
+                })
         else:
             # Altes Verhalten, unverändert für das bestehende Frontend:
             # sofort automatisch speichern.
@@ -1761,6 +1811,13 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 for hyp in synthese:
                     if isinstance(hyp, dict) and hyp.get("text"):
                         create_hypothesis_entry(conn, user["user_id"], hyp)
+
+            if isinstance(vision_vorschlag, dict) and vision_vorschlag.get("text"):
+                run_write(
+                    conn,
+                    "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'overall_vision', ?, FALSE, ?)",
+                    (user["user_id"], vision_vorschlag["text"], now_iso()),
+                )
     except Exception as exc:
         # Sekundäre Extraktion (Aufgaben/Standbein/Profil/Compass) fehlgeschlagen -
         # die Chat-Antwort selbst bleibt trotzdem erhalten und wird unten
@@ -1803,6 +1860,12 @@ def confirm_suggestion(body: SuggestionConfirmIn, user: dict = Depends(get_curre
             create_hypothesis_entry(conn, user["user_id"], body.payload)
         elif body.kind == "decision":
             create_decision_entry(conn, user["user_id"], body.payload)
+        elif body.kind == "vision":
+            run_write(
+                conn,
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'overall_vision', ?, FALSE, ?)",
+                (user["user_id"], body.payload.get("text", ""), now_iso()),
+            )
         else:
             raise HTTPException(status_code=400, detail=f"Unbekannte Vorschlagsart: {body.kind}")
     return {"ok": True}
@@ -2016,6 +2079,94 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
         return result
 
 
+COMPASS_CHECK_PROMPT = """Du bist der "Sole."-Mentor. Prüfe, ob die aktuellen offenen Aufgaben noch \
+zur strategischen Phase der jeweiligen Standbeine passen. Du bekommst unten pro Standbein die Phase \
+und eine Liste der aktuell offenen Aufgaben, die diesem Standbein zugeordnet sind.
+
+Antworte NUR als JSON:
+{
+  "mismatches": [
+    {"standbein_name": "...", "text": "kurze, konkrete Beobachtung - z.B. 'Dein Compass sagt Validierung, aber die meisten offenen Aufgaben drehen sich um Branding/Website.'", "empfehlung": "was du stattdessen priorisieren würdest, 1 Satz"}
+  ]
+}
+
+WICHTIG: das ist NICHT der Normalfall - trag nur ein, wenn es einen wirklich auffälligen, eindeutigen \
+Widerspruch gibt (z.B. deutliche Mehrheit der Aufgaben passt nicht zur Phase). Bei den meisten \
+Standbeinen sollte "mismatches" leer bleiben - ein Standbein, bei dem alles passt, taucht hier gar \
+nicht auf. Erfinde keinen Widerspruch, nur um etwas zurückzugeben."""
+
+
+@app.get("/compass/check")
+async def check_compass(user: dict = Depends(get_current_user)):
+    """Prüft, ob offene Aufgaben noch zur Phase ihres Standbeins passen — Briefing
+    Punkt 10A ('Compass muss dynamisch sein'). Einmal pro Tag geprüft, wie beim
+    täglichen Fokus, kein KI-Aufruf bei jedem Compass-Aufruf. Absichtlich nur der
+    Task↔Phase-Widerspruch (Punkt 10A) - der zweite Teil aus dem Briefing (Punkt 10B,
+    'neue Erkenntnisse widersprechen dem Compass') ist bewusst nicht gebaut, weil er
+    zu vage ist, um ihn objektiv/zuverlässig zu erkennen, ohne Widersprüche zu erfinden."""
+    import json
+
+    heute = datetime.now(timezone.utc).date().isoformat()
+
+    with get_db() as conn:
+        bestehende = fetch_entries(conn, user["user_id"], "compass_check", limit=5)
+        for entry in bestehende:
+            try:
+                data = json.loads(entry["content"])
+                if data.get("date") == heute:
+                    return data
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        ventures_raw = fetch_entries(conn, user["user_id"], "venture", limit=20)
+        alle_tasks = fetch_entries(conn, user["user_id"], "task", limit=300)
+
+        venture_kontext = []
+        for v in ventures_raw:
+            try:
+                v_data = json.loads(v["content"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if v_data.get("focus") == "parked":
+                continue  # geparkte Standbeine bewusst nicht prüfen
+            zugehoerige_tasks = [
+                t["content"] for t in alle_tasks
+                if str(t.get("venture_id")) == str(v["id"]) and t.get("status", "open") == "open"
+            ]
+            if not zugehoerige_tasks:
+                continue
+            venture_kontext.append(
+                f"Standbein: {v_data.get('name', '')} (Phase: {v_data.get('phase', 'idee')})\n"
+                + "\n".join(f"- {t}" for t in zugehoerige_tasks)
+            )
+
+        if not venture_kontext:
+            result = {"date": heute, "mismatches": []}
+            run_write(
+                conn,
+                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'compass_check', ?, FALSE, ?)",
+                (user["user_id"], json.dumps(result, ensure_ascii=False), now_iso()),
+            )
+            return result
+
+        kontext = "\n\n".join(venture_kontext)
+        raw = await call_claude(COMPASS_CHECK_PROMPT, [{"role": "user", "content": kontext}])
+        try:
+            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            parsed = json.loads(cleaned)
+            mismatches = parsed.get("mismatches", [])
+        except (json.JSONDecodeError, AttributeError):
+            mismatches = []
+
+        result = {"date": heute, "mismatches": mismatches if isinstance(mismatches, list) else []}
+        run_write(
+            conn,
+            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'compass_check', ?, FALSE, ?)",
+            (user["user_id"], json.dumps(result, ensure_ascii=False), now_iso()),
+        )
+        return result
+
+
 WEEKLY_REVIEW_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person hat um einen Wochenrückblick \
 gebeten. Du bekommst unten eine Liste, was diese Woche erledigt wurde, was liegen geblieben ist, und \
 den aktuellen Stand ihrer Standbeine.
@@ -2209,6 +2360,10 @@ class VentureIn(BaseModel):
     phase: str = "idee"
     role: str = ""
     focus: str = "secondary"
+    ziel: str = ""
+    annahmen: list[str] = []
+    entscheidungsbaum: dict = {}
+    notizen: str = ""
 
 
 def normalize_meilensteine(raw) -> list:
@@ -2225,6 +2380,8 @@ def normalize_meilensteine(raw) -> list:
                     m["erledigt"] = False
                 if "messgroesse" not in m:
                     m["messgroesse"] = ""
+                if "warum" not in m:
+                    m["warum"] = ""
         return raw
     return []
 
