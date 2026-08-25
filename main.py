@@ -889,6 +889,7 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
     "ziel": "was konkret erreicht werden soll (optional, nur wenn klar unterscheidbar von 'vision')",
     "annahmen": ["Liste kurzer Annahmen, die gerade gemacht werden, aber noch nicht bewiesen sind - optional"],
     "entscheidungsbaum": {"wenn_bestaetigt": "was passiert, wenn der Test positiv ausfällt", "wenn_unklar": "...", "wenn_negativ": "..."},
+    "zeithorizont": "z.B. '6-8 Wochen' - nur wenn aus dem Gespräch erkennbar, sonst weglassen",
     "meilensteine": [
       {"text": "konkreter nächster Test", "datum": "2026-08-25 oder null", "messgroesse": "optional", "warum": "kurz, warum genau dieser Test - optional"}
     ]
@@ -1492,6 +1493,8 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             v_data["annahmen"] = standbein_update["annahmen"]
         if standbein_update.get("entscheidungsbaum"):
             v_data["entscheidungsbaum"] = standbein_update["entscheidungsbaum"]
+        if standbein_update.get("zeithorizont"):
+            v_data["zeithorizont"] = standbein_update["zeithorizont"]
         bestehende_meilensteine = normalize_meilensteine(v_data.get("meilensteine"))
         bestehende_texte = {m.get("text", "").strip().lower() for m in bestehende_meilensteine}
         for m in neue_meilensteine:
@@ -1520,6 +1523,7 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> bool:
             "ziel": standbein_update.get("ziel", ""),
             "annahmen": standbein_update.get("annahmen", []),
             "entscheidungsbaum": standbein_update.get("entscheidungsbaum", {}),
+            "zeithorizont": standbein_update.get("zeithorizont", ""),
             "umsatz": [],
             "meilensteine": [
                 {
@@ -2079,31 +2083,39 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
         return result
 
 
-COMPASS_CHECK_PROMPT = """Du bist der "Sole."-Mentor. Prüfe, ob die aktuellen offenen Aufgaben noch \
-zur strategischen Phase der jeweiligen Standbeine passen. Du bekommst unten pro Standbein die Phase \
-und eine Liste der aktuell offenen Aufgaben, die diesem Standbein zugeordnet sind.
+COMPASS_CHECK_PROMPT = """Du bist der "Sole."-Mentor. Prüfe zwei Dinge anhand der Standbeine unten:
+
+1. Passen die aktuellen offenen Aufgaben noch zur strategischen Phase des jeweiligen Standbeins? \
+(bei Standbeinen mit "Phase: ..." markiert)
+2. Wurde an einem GEPARKTEN Standbein trotzdem kürzlich aktiv gearbeitet? (bei Standbeinen mit \
+"Status: GEPARKT, aber kürzlich aktiv" markiert)
 
 Antworte NUR als JSON:
 {
   "mismatches": [
-    {"standbein_name": "...", "text": "kurze, konkrete Beobachtung - z.B. 'Dein Compass sagt Validierung, aber die meisten offenen Aufgaben drehen sich um Branding/Website.'", "empfehlung": "was du stattdessen priorisieren würdest, 1 Satz"}
+    {"standbein_name": "...", "text": "kurze, konkrete Beobachtung", "empfehlung": "was du vorschlägst, 1 Satz"}
   ]
 }
 
+Beispiele für "text":
+- Phase-Widerspruch: "Dein Compass sagt Validierung, aber die meisten offenen Aufgaben drehen sich um Branding/Website."
+- Geparkt-aber-aktiv: "Du hast dieses Standbein geparkt, arbeitest aber seit einer Weile wieder daran."
+
 WICHTIG: das ist NICHT der Normalfall - trag nur ein, wenn es einen wirklich auffälligen, eindeutigen \
-Widerspruch gibt (z.B. deutliche Mehrheit der Aufgaben passt nicht zur Phase). Bei den meisten \
-Standbeinen sollte "mismatches" leer bleiben - ein Standbein, bei dem alles passt, taucht hier gar \
-nicht auf. Erfinde keinen Widerspruch, nur um etwas zurückzugeben."""
+Widerspruch gibt (z.B. deutliche Mehrheit der Aufgaben passt nicht zur Phase, oder klar mehrere \
+Aktivitäten an einem geparkten Standbein). Bei den meisten Standbeinen sollte "mismatches" leer \
+bleiben - ein Standbein, bei dem alles passt, taucht hier gar nicht auf. Erfinde keinen Widerspruch, \
+nur um etwas zurückzugeben."""
 
 
 @app.get("/compass/check")
 async def check_compass(user: dict = Depends(get_current_user)):
-    """Prüft, ob offene Aufgaben noch zur Phase ihres Standbeins passen — Briefing
-    Punkt 10A ('Compass muss dynamisch sein'). Einmal pro Tag geprüft, wie beim
-    täglichen Fokus, kein KI-Aufruf bei jedem Compass-Aufruf. Absichtlich nur der
-    Task↔Phase-Widerspruch (Punkt 10A) - der zweite Teil aus dem Briefing (Punkt 10B,
-    'neue Erkenntnisse widersprechen dem Compass') ist bewusst nicht gebaut, weil er
-    zu vage ist, um ihn objektiv/zuverlässig zu erkennen, ohne Widersprüche zu erfinden."""
+    """Prüft zwei Dinge: ob offene Aufgaben noch zur Phase ihres Standbeins passen
+    (Punkt 10A) UND ob an einem geparkten Standbein trotzdem aktiv weitergearbeitet
+    wird (Punkt 11 aus dem neueren Briefing). Einmal pro Tag geprüft, wie beim
+    täglichen Fokus, kein KI-Aufruf bei jedem Compass-Aufruf. Punkt 10B ('neue
+    Erkenntnisse widersprechen dem Compass') bleibt bewusst aussen vor - zu vage,
+    um ihn objektiv/zuverlässig zu erkennen, ohne Widersprüche zu erfinden."""
     import json
 
     heute = datetime.now(timezone.utc).date().isoformat()
@@ -2120,6 +2132,7 @@ async def check_compass(user: dict = Depends(get_current_user)):
 
         ventures_raw = fetch_entries(conn, user["user_id"], "venture", limit=20)
         alle_tasks = fetch_entries(conn, user["user_id"], "task", limit=300)
+        sieben_tage_alt = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
         venture_kontext = []
         for v in ventures_raw:
@@ -2127,8 +2140,23 @@ async def check_compass(user: dict = Depends(get_current_user)):
                 v_data = json.loads(v["content"])
             except (json.JSONDecodeError, TypeError):
                 continue
+
             if v_data.get("focus") == "parked":
-                continue  # geparkte Standbeine bewusst nicht prüfen
+                # Bewusst NICHT auf Phase-Widerspruch geprüft (ergibt bei geparkten
+                # Standbeinen keinen Sinn) - aber sehr wohl darauf, ob kürzlich
+                # trotzdem aktiv daran gearbeitet wurde (Briefing Punkt 11).
+                kuerzlich_aktiv = [
+                    t["content"] for t in alle_tasks
+                    if str(t.get("venture_id")) == str(v["id"])
+                    and (t.get("completed_at", "") >= sieben_tage_alt or t.get("created_at", "") >= sieben_tage_alt)
+                ]
+                if kuerzlich_aktiv:
+                    venture_kontext.append(
+                        f"Standbein: {v_data.get('name', '')} (Status: GEPARKT, aber kürzlich aktiv)\n"
+                        + "\n".join(f"- {t}" for t in kuerzlich_aktiv)
+                    )
+                continue
+
             zugehoerige_tasks = [
                 t["content"] for t in alle_tasks
                 if str(t.get("venture_id")) == str(v["id"]) and t.get("status", "open") == "open"
@@ -2364,6 +2392,7 @@ class VentureIn(BaseModel):
     annahmen: list[str] = []
     entscheidungsbaum: dict = {}
     notizen: str = ""
+    zeithorizont: str = ""
 
 
 def normalize_meilensteine(raw) -> list:
@@ -2491,6 +2520,40 @@ def delete_venture(venture_id: int, user: dict = Depends(get_current_user)):
             conn, "DELETE FROM entries WHERE id = ? AND user_id = ?", (venture_id, user["user_id"])
         )
     return {"ok": True}
+
+
+@app.post("/strategy/venture/{venture_id}/milestone/{index}/complete")
+def complete_milestone(venture_id: int, index: int, user: dict = Depends(get_current_user)):
+    """Markiert einen Test/Meilenstein als abgeschlossen. Sole wertet das NICHT
+    automatisch aus - die eigentliche Auswertung ('Was haben wir gelernt?')
+    passiert bewusst im Chat-Gespräch, nicht durch eine erfundene Analyse hier.
+    Gibt den Meilenstein-Text zurück, damit das Frontend gezielt mit Kontext
+    in den Chat springen kann (Briefing Punkt 7)."""
+    import json
+
+    with get_db() as conn:
+        rows = run_query(
+            conn, "SELECT * FROM entries WHERE id = ? AND user_id = ?", (venture_id, user["user_id"])
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Standbein nicht gefunden.")
+        try:
+            v_data = json.loads(rows[0]["content"])
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=500, detail="Standbein-Daten beschädigt.")
+
+        meilensteine = normalize_meilensteine(v_data.get("meilensteine"))
+        if index < 0 or index >= len(meilensteine):
+            raise HTTPException(status_code=404, detail="Meilenstein nicht gefunden.")
+
+        meilensteine[index]["erledigt"] = True
+        v_data["meilensteine"] = meilensteine
+        run_write(
+            conn,
+            "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
+            (json.dumps(v_data, ensure_ascii=False), venture_id, user["user_id"]),
+        )
+        return {"ok": True, "milestone_text": meilensteine[index]["text"], "venture_name": v_data.get("name", "")}
 
 
 # ---------------------------------------------------------------------------
