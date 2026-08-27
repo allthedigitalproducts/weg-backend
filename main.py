@@ -323,6 +323,37 @@ def extract_json_object(raw: str) -> dict:
         return json.loads(raw[start : end + 1])
 
 
+def select_relevant_turns(all_turns_desc: list, max_active_days: int = 2, hard_cap: int = 40) -> list:
+    """Wählt Nachrichten selektiv nach Aktualität aus, statt pauschal eine
+    feste Zahl mitzuschicken. Nimmt alle Nachrichten aus den `max_active_days`
+    jüngsten Tagen mit tatsächlicher Aktivität (nicht zwingend Kalendertage -
+    falls seit 5 Tagen nichts geschrieben wurde, zählt der letzte aktive Tag
+    trotzdem als "jüngster", die Lücke davor spielt keine Rolle).
+
+    Bewusst kein grosses Zeitfenster und keine Vector-/Embedding-Suche:
+    die strukturierten Daten (Standbeine, Entscheidungen, Hypothesen,
+    Profil - siehe build_memory_context) tragen bereits die längerfristige
+    Erinnerung. Der rohe Gesprächsverlauf muss nur die UNMITTELBARE
+    Anschlussfähigkeit sichern (worüber haben wir gerade eben gesprochen),
+    nicht beliebig weit zurückreichen.
+
+    all_turns_desc: Nachrichten neueste-zuerst (wie fetch_entries_by_types
+    liefert). hard_cap begrenzt die absolute Obergrenze für den Fall eines
+    extrem gesprächsintensiven einzelnen Tages."""
+    gesehene_tage = []
+    ausgewaehlt = []
+    for t in all_turns_desc:
+        tag = (t.get("created_at") or "")[:10]
+        if tag not in gesehene_tage:
+            if len(gesehene_tage) >= max_active_days:
+                break
+            gesehene_tage.append(tag)
+        ausgewaehlt.append(t)
+        if len(ausgewaehlt) >= hard_cap:
+            break
+    return ausgewaehlt
+
+
 def build_messages_with_date_markers(previous_turns: list) -> list:
     """Baut die messages-Liste für die Anthropic API und setzt an jedem
     Tageswechsel einen kurzen Datums-Hinweis vor die erste Nachricht dieses
@@ -356,6 +387,37 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+
+
+async def check_password_pwned(password: str) -> int:
+    """Prüft per k-Anonymity gegen die Have-I-Been-Pwned-Datenbank, ob ein
+    Passwort in einem bekannten Datenleck vorkommt. Das Passwort selbst
+    verlässt dabei NIE den Server - es wird lokal per SHA-1 gehasht, und nur
+    die ersten 5 Zeichen des Hash werden an die API geschickt. Die API
+    antwortet mit allen bekannten Hash-Endungen zu diesem Präfix, der
+    Abgleich mit dem vollen Hash passiert wieder lokal.
+
+    Gibt die Anzahl bekannter Vorkommen zurück (0 = unbekannt/sauber).
+    Schlägt der Aufruf fehl (API down, Timeout), wird das NICHT als Grund
+    zum Blockieren behandelt - lieber ein Signup ohne diese eine Prüfung
+    durchlassen, als Leute wegen eines Drittanbieter-Ausfalls auszusperren."""
+    import hashlib
+
+    sha1 = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix, suffix = sha1[:5], sha1[5:]
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"https://api.pwnedpasswords.com/range/{prefix}")
+            response.raise_for_status()
+            for line in response.text.splitlines():
+                line_suffix, count = line.split(":")
+                if line_suffix == suffix:
+                    return int(count)
+            return 0
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError):
+        log_error("PWNED_CHECK_FAILED", "Have-I-Been-Pwned-API nicht erreichbar oder fehlerhafte Antwort")
+        return 0
 
 
 def create_token(user_id: int, email: str) -> str:
@@ -1133,12 +1195,21 @@ Anführungszeichen, ohne zusätzliche Erklärung davor oder danach."""
 # ---------------------------------------------------------------------------
 
 @app.post("/auth/signup")
-def signup(payload: SignupIn):
+async def signup(payload: SignupIn):
     email = payload.email.strip().lower()
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Ungültige E-Mail-Adresse.")
-    if len(payload.password) < 8:
-        raise HTTPException(status_code=400, detail="Passwort muss mindestens 8 Zeichen haben.")
+    if len(payload.password) < 12:
+        raise HTTPException(status_code=400, detail="Passwort muss mindestens 12 Zeichen haben. Eine kurze Passphrase (mehrere Wörter) ist sicherer als ein kurzes, komplexes Passwort.")
+    if len(payload.password) > 128:
+        raise HTTPException(status_code=400, detail="Passwort darf maximal 128 Zeichen haben.")
+
+    pwned_count = await check_password_pwned(payload.password)
+    if pwned_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dieses Passwort wurde bereits in {pwned_count:,} bekannten Datenlecks gefunden. Bitte ein anderes wählen.",
+        )
 
     with get_db() as conn:
         existing = run_query(conn, "SELECT id FROM users WHERE email = ?", (email,))
@@ -1817,9 +1888,13 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
             # Bisherige Unterhaltung ALS ECHTE NACHRICHTEN abrufen, bevor wir die neue
             # Nachricht einfügen — das ist entscheidend, damit Claude sich innerhalb
             # des Gesprächs an bereits gestellte Fragen/Antworten erinnert.
-            previous_turns = fetch_entries_by_types(
-                conn, user["user_id"], ["chat_user", "chat_assistant"], limit=30
+            # Grösserer Pool zum Auswählen (nicht direkt limitiert auf das,
+            # was am Ende tatsächlich mitgeschickt wird) - select_relevant_turns
+            # entscheidet danach, wie viel davon wirklich relevant ist.
+            alle_turns = fetch_entries_by_types(
+                conn, user["user_id"], ["chat_user", "chat_assistant"], limit=80
             )
+            previous_turns = select_relevant_turns(alle_turns)
             previous_turns = list(reversed(previous_turns))  # chronologisch aufsteigend
 
             if not payload.retry_only:
