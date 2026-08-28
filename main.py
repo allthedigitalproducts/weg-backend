@@ -67,9 +67,22 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
 app = FastAPI(title="Sole. Backend")
 
+# Vorher allow_origins=["*"] - jede Website konnte Anfragen an die API stellen
+# und Antworten lesen. Kein funktionaler Nachteil, das einzuschränken: nur das
+# eigene Frontend muss legitim zugreifen können.
+#
+# WICHTIG BEIM DEPLOYEN: FRONTEND_ORIGIN unten muss exakt der tatsächlichen
+# Netlify-URL entsprechen (Netlify-Dashboard -> Site settings -> Domain
+# management), sonst blockiert das die echte App. Die hier eingetragene
+# Domain stammt aus dem einzigen Fundort im bestehenden Code (E-Mail-Link im
+# Wochen-Rückblick) - bitte vor dem Hochladen gegenprüfen, ob das noch die
+# aktuelle Produktions-URL ist, insbesondere falls seither eine eigene
+# Domain eingerichtet wurde.
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "https://charming-moxie-8f36aa.netlify.app")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -136,6 +149,25 @@ if USE_POSTGRES:
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS priority_reason TEXT")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual'")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS completed_at TEXT")
+            # Token-Nutzung — bewusst getrennt von "entries", nie Inhalte, nur
+            # Zahlen/Metadaten. Grundlage für "Context Management hat Input um
+            # X% reduziert" statt einer Schätzung.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS usage_log (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER,
+                    request_type TEXT NOT NULL,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_creation_input_tokens INTEGER,
+                    cache_read_input_tokens INTEGER,
+                    core_chars INTEGER,
+                    relevant_chars INTEGER,
+                    history_chars INTEGER,
+                    created_at TEXT NOT NULL
+                )
+            """)
 
     def run_query(conn, query: str, params: tuple = ()):
         """Führt eine Query aus und gibt eine Liste von dicts zurück (SELECT)."""
@@ -213,6 +245,23 @@ else:
                     conn.execute(f"ALTER TABLE entries ADD COLUMN {col_def}")
                 except sqlite3.OperationalError:
                     pass  # Spalte existiert schon
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS usage_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    request_type TEXT NOT NULL,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_creation_input_tokens INTEGER,
+                    cache_read_input_tokens INTEGER,
+                    core_chars INTEGER,
+                    relevant_chars INTEGER,
+                    history_chars INTEGER,
+                    created_at TEXT NOT NULL
+                )
+            """)
 
     def run_query(conn, query: str, params: tuple = ()):
         rows = conn.execute(query, params).fetchall()
@@ -594,7 +643,11 @@ def build_memory_context(conn, user_id: int) -> str:
     return "\n\n".join(parts) if parts else "Noch keine bisherige Historie vorhanden."
 
 
-async def call_claude(system_prompt: str, messages: list[dict]) -> str:
+async def call_claude(
+    system_prompt: str, messages: list[dict],
+    request_type: str = "sonstig", user_id: Optional[int] = None,
+    context_groesse: Optional[dict] = None,
+) -> str:
     """
     messages: Liste von {"role": "user"|"assistant", "content": "..."} — die komplette
     bisherige Unterhaltung inkl. der neuesten Nachricht. Das ist wichtig, damit Claude
@@ -605,6 +658,10 @@ async def call_claude(system_prompt: str, messages: list[dict]) -> str:
     SELBST als auch eine unerwartete/fehlerhafte Antwortstruktur ab (beides wurde vorher
     unterschiedlich robust behandelt - jetzt einheitlich, mit kategorisiertem Logging
     statt einer generischen "nicht erreichbar"-Meldung ohne Diagnose-Möglichkeit).
+
+    request_type/user_id/context_groesse: rein für die Nutzungs-Messung (usage_log) -
+    NIE Inhalte, nur Zahlen/Metadaten. Optional, damit bestehende Aufrufer ohne Änderung
+    weiterlaufen (loggen dann einfach unter "sonstig" ohne Grössenaufschlüsselung).
     """
     if not ANTHROPIC_API_KEY:
         log_error("AI_CONFIG_MISSING", "ANTHROPIC_API_KEY ist nicht gesetzt")
@@ -663,9 +720,38 @@ async def call_claude(system_prompt: str, messages: list[dict]) -> str:
             letzter_fehler = HTTPException(status_code=502, detail="Anthropic-Antwort enthielt keinen Text.")
             continue
 
+        log_usage(data.get("usage", {}), request_type, user_id, context_groesse)
         return "\n".join(text_blocks)
 
     raise letzter_fehler
+
+
+def log_usage(usage: dict, request_type: str, user_id: Optional[int], context_groesse: Optional[dict]) -> None:
+    """Schreibt NUR Zahlen/Metadaten weg, nie Inhalte - Grundlage dafür, nach den
+    fünf Testern tatsächlich sagen zu können 'Input um X% reduziert', statt zu
+    schätzen. Nutzt die von Anthropic selbst gelieferten Token-Zahlen (usage-Feld
+    der Response), keine eigene Schätzung. Ein Fehlschlag hier darf niemals den
+    eigentlichen Chat-Aufruf gefährden - deshalb komplett fehlertolerant."""
+    try:
+        with get_db() as conn:
+            groesse = context_groesse or {}
+            run_write(
+                conn,
+                """INSERT INTO usage_log
+                   (user_id, request_type, model, input_tokens, output_tokens,
+                    cache_creation_input_tokens, cache_read_input_tokens,
+                    core_chars, relevant_chars, history_chars, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user_id, request_type, ANTHROPIC_MODEL,
+                    usage.get("input_tokens"), usage.get("output_tokens"),
+                    usage.get("cache_creation_input_tokens"), usage.get("cache_read_input_tokens"),
+                    groesse.get("core_chars"), groesse.get("relevant_chars"), groesse.get("history_chars"),
+                    now_iso(),
+                ),
+            )
+    except Exception as exc:
+        log_error("USAGE_LOG_FAILED", str(exc))
 
 
 async def send_email(to: str, subject: str, html_body: str) -> bool:
@@ -1453,6 +1539,21 @@ def reset_account_data(user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
+@app.delete("/account/full")
+def delete_account_completely(user: dict = Depends(get_current_user)):
+    """Löscht das Konto WIRKLICH vollständig - im Unterschied zu /account/reset
+    bleibt hier nichts zurück: alle Inhalte UND die users-Zeile selbst (E-Mail,
+    Passwort-Hash) sind danach weg. Kein erneutes Anmelden mit derselben
+    Sitzung möglich, kein 'sofort neu starten'. Bewusst als eigener, deutlich
+    benannter Endpoint - nicht dieselbe Route wie der Reset, damit die beiden
+    unterschiedlich schwerwiegenden Aktionen nicht versehentlich verwechselt
+    werden können, weder im Code noch im Frontend."""
+    with get_db() as conn:
+        run_write(conn, "DELETE FROM entries WHERE user_id = ?", (user["user_id"],))
+        run_write(conn, "DELETE FROM users WHERE id = ?", (user["user_id"],))
+    return {"ok": True}
+
+
 def save_profile_merged(conn, user_id: int, updates: dict) -> dict:
     """Führt ein (evtl. unvollständiges) Profil-Update mit dem bisherigen Profil zusammen,
     statt es zu überschreiben — damit spätere Ergänzungen (z.B. nur 'Stärken' aus einem
@@ -1876,13 +1977,333 @@ def apply_compass_entwurf(conn, user_id: int, compass_entwurf: dict) -> None:
             apply_standbein_update(conn, user_id, standbein)
 
 
+# ---------------------------------------------------------------------------
+# Context Selection Architecture — CORE / RELEVANT / HISTORY
+#
+# Ersetzt für den Haupt-/chat-Endpoint das bisherige "immer alles" durch eine
+# frage-abhängige Auswahl. Bewusst NUR für /chat umgebaut, nicht für die
+# anderen 6 Stellen, die build_memory_context() nutzen (Onboarding-Start,
+# Reflexion, täglicher/wöchentlicher Fokus, Portfolio) - das sind einmalige,
+# bereits eng gefasste Generierungsaufgaben, keine wiederholte Chat-Schleife.
+#
+# Zielprinzip (nicht: minimaler Tokenverbrauch, sondern:): so wenig
+# irrelevanter Kontext wie möglich, bei maximaler strategischer Kontinuität.
+# ---------------------------------------------------------------------------
+
+STOPWORTE = {
+    "der", "die", "das", "und", "ich", "du", "wir", "ihr", "sie", "ist", "sind",
+    "was", "wie", "soll", "mache", "machen", "diese", "dieser", "dieses", "einen",
+    "eine", "einer", "eines", "für", "mit", "bei", "auf", "von", "als", "auch",
+    "noch", "mehr", "nicht", "kein", "keine", "über", "aber", "oder", "dann",
+    "jetzt", "heute", "morgen", "woche", "wochen", "beim", "zum", "zur",
+}
+
+
+def _woerter(text: str) -> set:
+    """Zerlegt einen Text in ein Set aus kleingeschriebenen Wörtern >= 4 Zeichen,
+    ohne Stoppwörter - bewusst simpel, keine Bibliothek, kein NLP-Modell."""
+    import re
+    roh = re.findall(r"[a-zA-ZäöüÄÖÜß]+", text.lower())
+    return {w for w in roh if len(w) >= 4 and w not in STOPWORTE}
+
+
+def _standbein_vokabular(v_data: dict) -> set:
+    """Baut das 'bekannte Vokabular' EINES Standbeins - nicht nur der Name,
+    sondern auch Begriffe aus Vision/Ziel/aktuellem Stand/aktuellem Test/
+    Meilensteinen. Deckt Fälle wie 'das mit den Kulturinstitutionen' ab, auch
+    wenn das Standbein selbst 'Consulting' heisst, solange 'Kulturinstitutionen'
+    irgendwo in dessen eigenen Texten vorkommt."""
+    vokabular = set()
+    name = v_data.get("name", "")
+    if name:
+        vokabular |= _woerter(name)
+        vokabular.add(name.lower().strip())  # ganzer Name als ein Token, für kurze Namen
+    for feld in ("vision", "ziel", "aktueller_stand"):
+        if v_data.get(feld):
+            vokabular |= _woerter(v_data[feld])
+    aktueller_test = v_data.get("aktueller_test")
+    if isinstance(aktueller_test, dict):
+        for feld in ("text", "warum"):
+            if aktueller_test.get(feld):
+                vokabular |= _woerter(aktueller_test[feld])
+    for m in normalize_meilensteine(v_data.get("meilensteine")):
+        if m.get("text"):
+            vokabular |= _woerter(m["text"])
+    return vokabular
+
+
+def erkenne_standbein(message: str, ventures_geparst: list, previous_turns: list) -> tuple:
+    """Gibt (venture_id, confidence) zurück. confidence: 'hoch' (im aktuellen
+    Text erkannt) | 'mittel' (aus jüngstem Gesprächsverlauf übernommen) |
+    'keine' (nichts Eindeutiges gefunden - bewusst NICHT geraten, siehe unten).
+
+    Bei mehreren gleichzeitig passenden Standbeinen: 'keine', nicht irgendeins
+    auswählen - lieber breiter bleiben als falsch einschränken."""
+    nachricht_woerter = _woerter(message)
+
+    treffer = []
+    for v_id, v_data in ventures_geparst:
+        vokabular = _standbein_vokabular(v_data)
+        name_lower = v_data.get("name", "").strip().lower()
+        if name_lower and name_lower in message.lower():
+            treffer.append(v_id)
+        elif nachricht_woerter & vokabular:
+            treffer.append(v_id)
+    if len(treffer) == 1:
+        return (treffer[0], "hoch")
+    if len(treffer) > 1:
+        return (None, "keine")  # mehrdeutig - nicht raten
+
+    # Nichts in der aktuellen Nachricht - jüngsten Gesprächsverlauf prüfen
+    # (max. letzte 4 Nachrichten, "worüber haben wir gerade gesprochen").
+    verlauf_text = " ".join(t.get("content", "") for t in previous_turns[-4:])
+    verlauf_woerter = _woerter(verlauf_text)
+    treffer_verlauf = []
+    for v_id, v_data in ventures_geparst:
+        vokabular = _standbein_vokabular(v_data)
+        name_lower = v_data.get("name", "").strip().lower()
+        if (name_lower and name_lower in verlauf_text.lower()) or (verlauf_woerter & vokabular):
+            treffer_verlauf.append(v_id)
+    if len(treffer_verlauf) == 1:
+        return (treffer_verlauf[0], "mittel")
+    return (None, "keine")
+
+
+def erkenne_zeitbezug(message: str) -> Optional[str]:
+    m = message.lower()
+    if any(w in m for w in ["heute", "jetzt gerade", "aktuell als nächstes"]):
+        return "heute"
+    if any(w in m for w in ["diese woche", "kommende woche", "nächsten tagen"]):
+        return "diese_woche"
+    return None
+
+
+def erkenne_fragecharakter(message: str) -> str:
+    m = message.lower()
+    if any(w in m for w in ["damals", "früher", "besprochen", "hatten wir", "gesagt hatte", "vor kurzem"]):
+        return "historisch"
+    if any(w in m for w in ["passt", "sicher ob", "zweifel", "überhaupt noch", "macht das sinn", "unsicher"]):
+        return "reflektierend"
+    # Stamm-Abgleich statt endloser Einzelwörter (Korrektur nach Rückmeldung -
+    # "sollte" wurde vorher nicht erkannt, nur "soll"): eine kleine, klar
+    # überschaubare Gruppe von Wortstämmen deckt automatisch soll/sollte/
+    # sollst/sollen, mache/machen/machst usw. mit ab, ohne jede Form einzeln
+    # aufzuzählen.
+    import re
+
+    operativ_staemme = ("soll", "mach", "angeh")
+    woerter_roh = re.findall(r"[a-zA-ZäöüÄÖÜß]+", m)
+    if any(w.startswith(stamm) for w in woerter_roh for stamm in operativ_staemme):
+        return "operativ"
+    if any(p in m for p in ["nächster schritt", "nächsten schritt", "womit anfangen", "was jetzt", "als nächstes", " tun"]):
+        return "operativ"
+    return "unklar"
+
+
+def route_context(message: str, ventures_geparst: list, previous_turns: list) -> dict:
+    venture_id, confidence = erkenne_standbein(message, ventures_geparst, previous_turns)
+    return {
+        "standbein_id": venture_id,
+        "standbein_confidence": confidence,
+        "zeitbezug": erkenne_zeitbezug(message),
+        "fragecharakter": erkenne_fragecharakter(message),
+    }
+
+
+def build_core_context(conn, user_id: int, ventures_geparst: list) -> str:
+    """Klein, IMMER dabei, nie themengefiltert. profil.rahmen ist hier bewusst
+    Pflicht (nicht optional) - genau das '60-Stunden-Woche'-Beispiel darf durch
+    keine Themen-Auswahl verloren gehen können."""
+    import json
+
+    parts = []
+    profile_rows = fetch_entries(conn, user_id, "profile", limit=1)
+    if profile_rows:
+        try:
+            p = json.loads(profile_rows[0]["content"])
+            zeile = f"Kommunikationsstil-Wunsch: {p.get('stil', '-')}"
+            if p.get("rahmen"):
+                zeile += f"\nWichtige Rahmenbedingungen/Grenzen (IMMER respektieren): {p['rahmen']}"
+            parts.append(zeile)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    vision_rows = fetch_entries(conn, user_id, "overall_vision", limit=1)
+    if vision_rows:
+        parts.append(f"Übergeordnete Vision: {vision_rows[0]['content']}")
+
+    if ventures_geparst:
+        zeilen = []
+        for v_id, v_data in ventures_geparst:
+            stand = f" — {v_data['aktueller_stand']}" if v_data.get("aktueller_stand") else ""
+            zeilen.append(
+                f"- {v_data.get('name', 'unbenannt')} [{v_data.get('focus', 'secondary')}, "
+                f"{v_data.get('phase', 'idee')}]{stand}"
+            )
+        parts.append("Standbein-Landschaft (kompakt):\n" + "\n".join(zeilen))
+
+    return "\n\n".join(parts)
+
+
+def build_relevant_context(conn, user_id: int, ventures_geparst: list, routing: dict) -> str:
+    """Frage-abhängig. 'heute' bedeutet NICHT nur due_date=heute (Korrektur
+    nach Rückmeldung) - auch ohne terminierte Aufgaben soll Sole anhand von
+    primärem Standbein + aktuellem Test/Meilenstein einen sinnvollen nächsten
+    Schritt vorschlagen können, exakt wie beim bestehenden Dashboard-Fokus."""
+    import json
+
+    parts = []
+    alle_tasks = fetch_entries(conn, user_id, "task", limit=200)
+    offene_tasks = [t for t in alle_tasks if t.get("status", "open") == "open"]
+
+    ziel_venture = None
+    if routing["standbein_id"]:
+        ziel_venture = next((v for v_id, v in ventures_geparst if v_id == routing["standbein_id"]), None)
+
+    if ziel_venture:
+        zeile = f"Fokussiertes Standbein: {ziel_venture.get('name')}\n"
+        zeile += f"Ziel: {ziel_venture.get('ziel', '-')}\n"
+        if ziel_venture.get("aktueller_stand"):
+            zeile += f"Aktueller Stand: {ziel_venture['aktueller_stand']}\n"
+        aktueller_test = ziel_venture.get("aktueller_test")
+        if isinstance(aktueller_test, dict) and aktueller_test.get("text"):
+            zeile += f"Aktueller Test: {aktueller_test['text']}"
+            if aktueller_test.get("warum"):
+                zeile += f" (Warum: {aktueller_test['warum']})"
+        meilensteine = normalize_meilensteine(ziel_venture.get("meilensteine"))
+        offen_m = [m for m in meilensteine if m.get("status") != "erreicht"]
+        if offen_m:
+            zeile += f"\nNächster Meilenstein: {offen_m[0].get('text', '')}"
+        parts.append(zeile)
+        relevante_tasks = [t for t in offene_tasks if t.get("venture_id") == routing["standbein_id"]]
+    else:
+        # Kein eindeutiges Standbein erkannt - primäres Standbein als Standard
+        # nehmen (für 'heute'-artige Fragen ohne Themenbezug), sonst gar keine
+        # zusätzliche Standbein-Auswahl (CORE deckt die Landschaft schon ab).
+        primary_eintrag = next((pair for pair in ventures_geparst if pair[1].get("focus") == "primary"), None)
+        if primary_eintrag and routing["zeitbezug"] == "heute":
+            primary_id, primary = primary_eintrag
+            aktueller_test = primary.get("aktueller_test")
+            zeile = f"Primäres Standbein: {primary.get('name')}"
+            if isinstance(aktueller_test, dict) and aktueller_test.get("text"):
+                zeile += f" | Aktueller Test: {aktueller_test['text']}"
+            parts.append(zeile)
+            relevante_tasks = [t for t in offene_tasks if t.get("venture_id") == primary_id]
+        else:
+            relevante_tasks = []
+
+    # Tasks: "heute" heisst geplante Tasks HEUTE + trotzdem ein paar weitere
+    # offene, damit Sole auch ohne terminierte Aufgabe einen nächsten Schritt
+    # vorschlagen kann - nicht nur "du hast heute nichts geplant".
+    heute = datetime.now(timezone.utc).date().isoformat()
+    if routing["zeitbezug"] == "heute":
+        geplant_heute = [t for t in offene_tasks if t.get("due_date") == heute]
+        kombiniert = geplant_heute + [t for t in relevante_tasks if t not in geplant_heute]
+        task_liste = kombiniert[:8]
+    elif routing["zeitbezug"] == "diese_woche":
+        wochenende = (datetime.now(timezone.utc).date() + timedelta(days=7)).isoformat()
+        task_liste = [t for t in (relevante_tasks or offene_tasks) if t.get("due_date") and heute <= t["due_date"] <= wochenende][:10]
+    elif relevante_tasks:
+        task_liste = relevante_tasks[:10]
+    else:
+        # Kompakter Standard statt der bisherigen 15 - die nächsten fälligen.
+        mit_datum = sorted([t for t in offene_tasks if t.get("due_date")], key=lambda t: t["due_date"])
+        task_liste = mit_datum[:5]
+
+    if task_liste:
+        parts.append("Relevante offene Aufgaben:\n" + "\n".join(f"- {t['content']}" for t in task_liste))
+
+    # Entscheidungen/Hypothesen: falls Standbein erkannt, nur die dazu passenden;
+    # sonst eine kleine, aktuelle Auswahl statt aller.
+    hyp_rows = fetch_entries(conn, user_id, "hypothesis", limit=15)
+    dec_rows = fetch_entries(conn, user_id, "decision", limit=15)
+    hyp_zeilen, dec_zeilen = [], []
+    ziel_name = ziel_venture.get("name", "").strip().lower() if ziel_venture else None
+    for h in hyp_rows:
+        try:
+            d = json.loads(h["content"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if d.get("status") == "widerlegt":
+            continue
+        if ziel_name and (d.get("standbein_name") or "").strip().lower() != ziel_name:
+            continue
+        hyp_zeilen.append(f"- [{d.get('status', 'aktiv')}] {d.get('text', '')}")
+        if len(hyp_zeilen) >= 5:
+            break
+    for d_row in dec_rows:
+        try:
+            d = json.loads(d_row["content"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        dec_zeilen.append(f"- {d.get('text', '')} ({d_row['created_at'][:10]})")
+        if len(dec_zeilen) >= 5:
+            break
+    if hyp_zeilen:
+        parts.append("Relevante Hypothesen:\n" + "\n".join(hyp_zeilen))
+    if dec_zeilen:
+        parts.append("Kürzliche Entscheidungen:\n" + "\n".join(dec_zeilen))
+
+    return "\n\n".join(parts)
+
+
+def build_history_context(conn, user_id: int, message: str) -> str:
+    """Nur bei rückblickenden Fragen aufgerufen. V1 bewusst ohne Postgres Full-
+    Text-Search/Embeddings (auf Wunsch zurückgestellt, bis eine einfache Suche
+    sich als unzureichend erweist) - einfache LIKE-Suche über Notizen/
+    Entscheidungen/Hypothesen und ältere Chat-Nachrichten (ausserhalb der 2
+    aktiven Tage, die select_relevant_turns ohnehin schon liefert)."""
+    import json
+
+    suchbegriffe = list(_woerter(message))[:5]
+    if not suchbegriffe:
+        return ""
+
+    treffer = []
+    mentor_notizen = fetch_entries(conn, user_id, "mentor_notiz", limit=50)
+    for n in mentor_notizen:
+        text_lower = n["content"].lower()
+        if any(b in text_lower for b in suchbegriffe):
+            treffer.append(f"[Notiz, {n['created_at'][:10]}] {n['content']}")
+
+    for typ, label in [("decision", "Entscheidung"), ("hypothesis", "Hypothese")]:
+        for row in fetch_entries(conn, user_id, typ, limit=30):
+            try:
+                d = json.loads(row["content"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            text_lower = (d.get("text") or "").lower()
+            if any(b in text_lower for b in suchbegriffe):
+                treffer.append(f"[{label}, {row['created_at'][:10]}] {d.get('text', '')}")
+
+    # Ältere Chat-Nachrichten (ausserhalb der aktiven Tage) - einfache Suche,
+    # kein Index, für den Massstab von Sole ausreichend.
+    aeltere_turns = fetch_entries_by_types(conn, user_id, ["chat_user", "chat_assistant"], limit=200)
+    for t in aeltere_turns:
+        text_lower = t["content"].lower()
+        if any(b in text_lower for b in suchbegriffe):
+            treffer.append(f"[Chat, {t['created_at'][:10]}] {t['content'][:200]}")
+        if len(treffer) >= 12:
+            break
+
+    if not treffer:
+        # Fallback: nichts über die Stichwortsuche gefunden - lieber die
+        # verdichteten Mentor-Notizen insgesamt anbieten als gar nichts,
+        # da Themen wie "Motivation" dort eher auftauchen als im Wortlaut.
+        if mentor_notizen:
+            return "Keine exakte Stichwort-Übereinstimmung gefunden. Bisherige Beobachtungen insgesamt:\n" + \
+                   "\n".join(n["content"] for n in mentor_notizen[:10])
+        return ""
+
+    return "Gefundene ältere, thematisch passende Einträge:\n" + "\n".join(treffer[:12])
+
+
 @app.post("/chat")
 async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
     import json
 
     try:
         with get_db() as conn:
-            memory = build_memory_context(conn, user["user_id"])
             has_profile = bool(fetch_entries(conn, user["user_id"], "profile", limit=1))
 
             # Bisherige Unterhaltung ALS ECHTE NACHRICHTEN abrufen, bevor wir die neue
@@ -1896,6 +2317,35 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
             )
             previous_turns = select_relevant_turns(alle_turns)
             previous_turns = list(reversed(previous_turns))  # chronologisch aufsteigend
+
+            # Context Selection: nur im regulären Mentor-Modus (nicht Onboarding/
+            # Checkin, die andere, meist umfassendere Kontext-Bedürfnisse haben -
+            # Onboarding baut z.B. gerade erst das Bild auf, da ist "alles" richtig).
+            ist_mentor_modus = has_profile and payload.mode not in ("checkin", "onboarding")
+            routing = None
+            context_groesse = None
+            if ist_mentor_modus:
+                ventures_raw = fetch_entries(conn, user["user_id"], "venture", limit=20)
+                ventures_geparst = []
+                for v in ventures_raw:
+                    try:
+                        ventures_geparst.append((v["id"], json.loads(v["content"])))
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                routing = route_context(payload.message, ventures_geparst, previous_turns)
+                core = build_core_context(conn, user["user_id"], ventures_geparst)
+                relevant = build_relevant_context(conn, user["user_id"], ventures_geparst, routing)
+                history = (
+                    build_history_context(conn, user["user_id"], payload.message)
+                    if routing["fragecharakter"] == "historisch"
+                    else ""
+                )
+                memory = "\n\n".join(p for p in [core, relevant, history] if p)
+                context_groesse = {
+                    "core_chars": len(core), "relevant_chars": len(relevant), "history_chars": len(history),
+                }
+            else:
+                memory = build_memory_context(conn, user["user_id"])
 
             if not payload.retry_only:
                 # Normalfall: neue Nachricht wirklich speichern.
@@ -1937,7 +2387,10 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         "besprochen wurde - wichtig z.B. wenn die Person nach 'gestern' oder 'letzter Woche' fragt."
     )
     system_prompt = f"{base_prompt}\n\n{heute_text}\n\n--- Bekannte Eckdaten der Person (Profil, Vision, Aufgaben) ---\n{memory}"
-    raw = await call_claude(system_prompt, messages)
+    raw = await call_claude(
+        system_prompt, messages,
+        request_type=f"chat_{payload.mode or 'mentor'}", user_id=user["user_id"], context_groesse=context_groesse,
+    )
 
     try:
         parsed = extract_json_object(raw)
@@ -2630,11 +3083,48 @@ class NextStepAcceptIn(BaseModel):
 @app.post("/dashboard/next-step/accept")
 def accept_next_step(body: NextStepAcceptIn, user: dict = Depends(get_current_user)):
     """Legt den vorgeschlagenen nächsten Schritt als echte, verknüpfte Aufgabe an -
-    mit Kapazitäts-Prüfung, genau wie beim regulären Fokus übernehmen."""
+    mit Kapazitäts-Prüfung, genau wie beim regulären Fokus übernehmen.
+
+    Sicherheits-Fund aus dem Infrastruktur-Audit behoben: venture_id/test_id kamen
+    bisher ungeprüft aus dem Request-Body direkt in die neue Aufgabe. Aktuell führte
+    das zu keinem Datenleck (jede lesende Stelle prüft Eigentümerschaft erneut),
+    aber das war Zufall, keine Absicht - die Grundregel 'keine Client-ID wird
+    ungeprüft übernommen' gilt jetzt auch hier, unabhängig vom aktuellen Blast-Radius.
+
+    Bewusst 404 statt stillem Null-Setzen bei einer fremden/ungültigen ID (Korrektur
+    nach Rückmeldung): eine fremde ID ungeprüft zu ignorieren, könnte einen echten
+    Client- oder Security-Fehler unbemerkt lassen und würde Aufgaben ohne die
+    eigentlich erwartete strategische Verknüpfung erzeugen, ohne dass das auffällt.
+    Fehlt die ID komplett (nicht mitgeschickt), ist das dagegen ein legitimer,
+    fehlerfreier Fall - kein Standbein-Bezug gewünscht."""
     import json
 
     heute = datetime.now(timezone.utc).date().isoformat()
     with get_db() as conn:
+        if body.venture_id:
+            rows = run_query(
+                conn, "SELECT content FROM entries WHERE id = ? AND user_id = ? AND type = 'venture'",
+                (body.venture_id, user["user_id"]),
+            )
+            if not rows:
+                raise HTTPException(status_code=404, detail="Standbein nicht gefunden oder gehört nicht zu deinem Konto.")
+            if body.test_id:
+                try:
+                    v_data = json.loads(rows[0]["content"])
+                except (json.JSONDecodeError, TypeError):
+                    v_data = {}
+                aktueller_test = v_data.get("aktueller_test")
+                bekannte_test_ids = {t.get("id") for t in (v_data.get("test_historie") or [])}
+                if isinstance(aktueller_test, dict):
+                    bekannte_test_ids.add(aktueller_test.get("id"))
+                if body.test_id not in bekannte_test_ids:
+                    raise HTTPException(status_code=404, detail="Test nicht gefunden oder gehört nicht zu diesem Standbein.")
+        elif body.test_id:
+            # test_id ohne venture_id ergibt keinen Sinn - Tests existieren nur
+            # eingebettet in einem Standbein, es gibt keine eigenständige Suche
+            # danach, die ohne venture_id auskäme.
+            raise HTTPException(status_code=400, detail="test_id kann nicht ohne venture_id geprüft werden.")
+
         dauer = body.dauer_minuten or 30
         ziel_datum = find_capacity_slot(conn, user["user_id"], dauer, heute)
         neue_task_id = run_write(
@@ -3336,10 +3826,13 @@ async def send_weekly_digests(x_cron_secret: str = Header(None)):
         except HTTPException:
             absatz = "Schön, dass du diese Woche dabei warst."
 
+        import html as html_escape_module
+        absatz_sicher = html_escape_module.escape(absatz)
+
         html = f"""
         <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px;">
           <h2 style="font-family:serif;">Sole. — Dein Wochenrückblick</h2>
-          <p>{absatz}</p>
+          <p>{absatz_sicher}</p>
           <p style="font-size:13px;color:#666;">
             {len(erledigt_diese_woche)} Aufgabe(n) erledigt diese Woche, {len(offen)} noch offen.
           </p>
