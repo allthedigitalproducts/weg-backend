@@ -157,6 +157,7 @@ if USE_POSTGRES:
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS priority_reason TEXT")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual'")
             cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS completed_at TEXT")
+            cur.execute("ALTER TABLE entries ADD COLUMN IF NOT EXISTS verschoben_anzahl INTEGER DEFAULT 0")
             # Token-Nutzung — bewusst getrennt von "entries", nie Inhalte, nur
             # Zahlen/Metadaten. Grundlage für "Context Management hat Input um
             # X% reduziert" statt einer Schätzung.
@@ -251,6 +252,10 @@ else:
                 "venture_id INTEGER", "milestone_text TEXT", "sole_priority INTEGER",
                 "priority_reason TEXT", "source TEXT DEFAULT 'manual'", "completed_at TEXT",
                 "test_id TEXT", "milestone_id TEXT",
+                # Sprint 3 "Sole Signals" (Aug 2026): Zähler, wie oft das
+                # Fälligkeitsdatum einer Aufgabe geändert wurde - Grundlage
+                # für das "mehrfach verschoben"-Signal. Additiv, Standard 0.
+                "verschoben_anzahl INTEGER DEFAULT 0",
             ]:
                 try:
                     conn.execute(f"ALTER TABLE entries ADD COLUMN {col_def}")
@@ -955,6 +960,12 @@ nicht.
 sich etwas validiert oder widerlegt. Wenn die Person sowas als "nächsten Schritt" nennt: das gehört \
 in "neue_aufgaben", nicht in "aktueller_test". Frag im Zweifel nach, statt eine Aufgabe fälschlich \
 als Test einzutragen.
+  SELBSTPRÜFUNG VOR JEDEM "aktueller_test": Bevor du das Feld befüllst, prüfe ausdrücklich: (1) Hast \
+du sowohl "frage" als auch "handlung" UND "signal" wirklich befüllt, nicht nur "frage" allein? (2) \
+Würde eine neutrale Person nach dem Test sagen können "ja, das wurde bestätigt" oder "nein, das \
+wurde widerlegt" - oder bleibt am Ende bloss ein Gefühl übrig? Falls du nur eine Aktivität ohne \
+klares Signal hast, trag GAR KEINEN "aktueller_test" ein, statt eine unvollständige Version zu \
+speichern - besser nichts als ein falscher Test, der wie ein echter aussieht.
   Es gibt zu jedem Zeitpunkt höchstens EINEN aktuellen Test pro Standbein - ein neuer \
 "aktueller_test" ERSETZT den alten (der alte bleibt intern nachvollziehbar, das übernimmt das \
 Backend automatisch).
@@ -975,14 +986,20 @@ verwenden.
 Konsequenzen je nach Testausgang durchdacht hat, trag das in "entscheidungsbaum" ein: \
 {"wenn_bestaetigt": "...", "wenn_unklar": "...", "wenn_negativ": "..."} - nur wenn das wirklich aus \
 dem Gespräch hervorgeht, nicht erfinden.
-- WENN EIN TEST ABGESCHLOSSEN WIRD: das darf NIE nur "erledigt" bedeuten. Frag aktiv nach: "Was ist \
-dabei rausgekommen?" Sobald die Person das Ergebnis beschreibt, trag "test_ergebnis" ein: \
+- WENN EIN TEST ABGESCHLOSSEN WIRD: das darf NIE nur "erledigt" bedeuten, und die Kette darf NICHT bei \
+der Erkenntnis aufhören - ein Mentor endet nicht mit "das haben wir gelernt", sondern mit einer \
+konkreten nächsten Handlung. Frag zuerst aktiv nach: "Was ist dabei rausgekommen?" Sobald die Person \
+das Ergebnis beschreibt, trag "test_ergebnis" ein: \
 {"venture_name": "...", "ergebnis": "kurze, konkrete Zusammenfassung dessen, was tatsächlich \
 passiert ist - Zahlen/Fakten, keine Interpretation", "sole_einschaetzung": "was das für die \
 ursprüngliche Frage bedeutet - bestätigt/widerlegt/uneindeutig, mit Begründung", "empfehlung": \
-"was als Nächstes sinnvoll ist - neuer Test, angepasster Kurs, oder weiter wie geplant"}. Prüfe \
-danach aktiv, ob der jetzt aktuelle (nächste offene) Meilenstein strategisch noch sinnvoll ist, und \
-schlage bei Bedarf eine Änderung vor - nicht einfach stillschweigend weitermachen.
+"was als Nächstes sinnvoll ist, in einem Satz zusammengefasst", \
+"naechster_test": {"frage": "...", "handlung": "...", "signal": "...", "warum": "..."} - NUR wenn \
+aus deiner Einschätzung ein konkreter neuer Test hervorgeht (gleiche Strenge wie bei jedem \
+"aktueller_test" - Frage+Handlung+Signal, keine blosse Aktivität). Weglassen, wenn der bisherige \
+Test/Meilenstein unverändert weiterläuft oder die Lage noch unklar ist - nicht erzwingen.} \
+Prüfe danach aktiv, ob der jetzt aktuelle (nächste offene) Meilenstein strategisch noch sinnvoll \
+ist, und schlage bei Bedarf eine Änderung vor - nicht einfach stillschweigend weitermachen.
 - ANNAHMEN FESTHALTEN: wenn im Gespräch klar wird, dass eine Empfehlung auf unbewiesenen Annahmen \
 beruht (z.B. "Unternehmen haben dieses Problem", "sie sind bereit, dafür zu bezahlen") - trag diese \
 kurz und stichpunktartig in "annahmen" ein (Liste). Das macht sichtbar, worauf eine Einschätzung \
@@ -1597,6 +1614,18 @@ def update_entry(entry_id: int, update: EntryUpdate, user: dict = Depends(get_cu
                 (entry_id, user["user_id"]),
             )
         elif update.due_date is not None:
+            # Sprint 3 "Sole Signals": Verschiebungs-Zähler nur bei einer
+            # ECHTEN Verschiebung hochzählen - ein bereits vorhandenes Datum
+            # wird auf ein anderes geändert. Die allererste Terminvergabe
+            # (vorher kein Datum) zählt bewusst NICHT als "verschoben".
+            bisherige = run_query(conn, "SELECT due_date FROM entries WHERE id = ? AND user_id = ?", (entry_id, user["user_id"]))
+            war_bereits_terminiert = bisherige and bisherige[0]["due_date"] and bisherige[0]["due_date"] != update.due_date
+            if war_bereits_terminiert:
+                run_write(
+                    conn,
+                    "UPDATE entries SET verschoben_anzahl = COALESCE(verschoben_anzahl, 0) + 1 WHERE id = ? AND user_id = ?",
+                    (entry_id, user["user_id"]),
+                )
             run_write(
                 conn,
                 "UPDATE entries SET due_date = ? WHERE id = ? AND user_id = ?",
@@ -2172,6 +2201,18 @@ def apply_test_ergebnis(conn, user_id: int, test_ergebnis: dict) -> bool:
     historie[ziel_index]["sole_einschaetzung"] = test_ergebnis.get("sole_einschaetzung", "")
     historie[ziel_index]["empfehlung"] = test_ergebnis.get("empfehlung", "")
     v_data["test_historie"] = historie
+
+    # Sprint 1 "Close the Loop" (Rückmeldung): die Kette darf nicht bei der
+    # Erkenntnis aufhören. Falls Sole einen konkreten nächsten Test
+    # mitgeliefert hat, wird er hier direkt gesetzt - dieselbe Funktion, die
+    # auch der reguläre Chat-Flow für einen neuen Test nutzt, kein separater
+    # Mechanismus. Bei bereits archiviertem, ergebnislosen aktuellen Test
+    # (aktueller_test ist zu diesem Zeitpunkt bereits None, siehe
+    # complete_test()) landet der neue Test direkt als aktueller_test,
+    # ohne fälschlich nochmal etwas zu archivieren.
+    naechster_test = test_ergebnis.get("naechster_test")
+    if isinstance(naechster_test, dict) and (naechster_test.get("frage") or naechster_test.get("text")):
+        v_data = _standbein_aktueller_test_setzen(v_data, naechster_test)
 
     run_write(
         conn, "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
@@ -3491,115 +3532,266 @@ def accept_next_step(body: NextStepAcceptIn, user: dict = Depends(get_current_us
 
 
 
-COMPASS_CHECK_PROMPT = """Du bist der "Sole."-Mentor. Prüfe zwei Dinge anhand der Standbeine unten:
+SOLE_SIGNALS_AI_PROMPT = """Du bist der "Sole."-Mentor. Prüfe anhand des Kontexts unten auf bis zu \
+drei Dinge - nur wenn wirklich eindeutig erkennbar, nichts erfinden:
 
-1. Passen die aktuellen offenen Aufgaben noch zur strategischen Phase des jeweiligen Standbeins? \
-(bei Standbeinen mit "Phase: ..." markiert)
-2. Wurde an einem GEPARKTEN Standbein trotzdem kürzlich aktiv gearbeitet? (bei Standbeinen mit \
-"Status: GEPARKT, aber kürzlich aktiv" markiert)
+1. PHASE-WIDERSPRUCH: passen die offenen Aufgaben eines Standbeins noch zu seiner Phase? (bei \
+Standbeinen mit "Phase: ..." markiert)
+2. GEPARKT-ABER-AKTIV: wurde an einem geparkten Standbein trotzdem kürzlich gearbeitet? (bei \
+Standbeinen mit "Status: GEPARKT, aber kürzlich aktiv" markiert)
+3. RAHMEN-VERLETZUNG: widerspricht die für diese Woche geplante Aktivität klar den Rahmenbedingungen \
+der Person (z.B. maximale Arbeitstage/-stunden)? Nur eintragen, wenn wirklich ein klarer, direkter \
+Widerspruch erkennbar ist - "Rahmen: ..." und "Diese Woche geplant: ..." stehen unten im Kontext.
 
 Antworte NUR als JSON:
 {
-  "mismatches": [
-    {"standbein_name": "...", "text": "kurze, konkrete Beobachtung", "empfehlung": "was du vorschlägst, 1 Satz"}
+  "signale": [
+    {"signal_type": "phase_mismatch" | "geparkt_aktiv" | "rahmen_verletzt", "standbein_name": "... oder null bei rahmen_verletzt", "message": "kurze, konkrete Beobachtung", "reason": "1 Satz Begründung", "recommended_action": "was du vorschlägst, 1 Satz"}
   ]
 }
 
-Beispiele für "text":
-- Phase-Widerspruch: "Dein Compass sagt Validierung, aber die meisten offenen Aufgaben drehen sich um Branding/Website."
-- Geparkt-aber-aktiv: "Du hast dieses Standbein geparkt, arbeitest aber seit einer Weile wieder daran."
-
 WICHTIG: das ist NICHT der Normalfall - trag nur ein, wenn es einen wirklich auffälligen, eindeutigen \
-Widerspruch gibt (z.B. deutliche Mehrheit der Aufgaben passt nicht zur Phase, oder klar mehrere \
-Aktivitäten an einem geparkten Standbein). Bei den meisten Standbeinen sollte "mismatches" leer \
-bleiben - ein Standbein, bei dem alles passt, taucht hier gar nicht auf. Erfinde keinen Widerspruch, \
-nur um etwas zurückzugeben."""
+Widerspruch gibt. Bei den meisten Standbeinen/Wochen sollte "signale" leer bleiben. Erfinde keinen \
+Widerspruch, nur um etwas zurückzugeben. Signale sollen SELTEN sein, nicht bei jeder Kleinigkeit \
+auftauchen - lieber nichts melden als etwas Schwaches."""
 
 
-@app.get("/compass/check")
-async def check_compass(user: dict = Depends(get_current_user)):
-    """Prüft zwei Dinge: ob offene Aufgaben noch zur Phase ihres Standbeins passen
-    (Punkt 10A) UND ob an einem geparkten Standbein trotzdem aktiv weitergearbeitet
-    wird (Punkt 11 aus dem neueren Briefing). Einmal pro Tag geprüft, wie beim
-    täglichen Fokus, kein KI-Aufruf bei jedem Compass-Aufruf. Punkt 10B ('neue
-    Erkenntnisse widersprechen dem Compass') bleibt bewusst aussen vor - zu vage,
-    um ihn objektiv/zuverlässig zu erkennen, ohne Widersprüche zu erfinden."""
-    import json
+def _signal_existiert_aktiv(conn, user_id: int, signal_type: str, related_venture_id=None, related_task_id=None) -> bool:
+    """Verhindert doppelte Signale (Rückmeldung: 'selten und relevant'). Ein
+    Signal desselben Typs für dasselbe Standbein/dieselbe Aufgabe wird nur
+    einmal aktiv gehalten - erst nach Auflösung (resolved_at gesetzt) UND
+    Ablauf einer kurzen Abkühlfrist kann es erneut entstehen, damit ein
+    gerade erst abgehaktes Signal nicht sofort wieder auftaucht."""
+    bestehende = fetch_entries(conn, user_id, "signal", limit=200)
+    abkuehlfrist = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+    for entry in bestehende:
+        try:
+            s = json.loads(entry["content"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if s.get("signal_type") != signal_type:
+            continue
+        if related_venture_id is not None and s.get("related_venture_id") != related_venture_id:
+            continue
+        if related_task_id is not None and s.get("related_task_id") != related_task_id:
+            continue
+        if not s.get("resolved_at"):
+            return True  # noch aktiv, nicht erneut anlegen
+        if s["resolved_at"] >= abkuehlfrist:
+            return True  # kürzlich aufgelöst, Abkühlfrist noch nicht um
+    return False
 
+
+def _signal_anlegen(conn, user_id: int, signal_type: str, severity: str, message: str, reason: str,
+                     recommended_action: str, related_venture_id=None, related_task_id=None) -> None:
+    if _signal_existiert_aktiv(conn, user_id, signal_type, related_venture_id, related_task_id):
+        return
+    content = {
+        "signal_type": signal_type, "severity": severity, "message": message, "reason": reason,
+        "recommended_action": recommended_action, "related_venture_id": related_venture_id,
+        "related_task_id": related_task_id, "resolved_at": None,
+    }
+    run_write(
+        conn, "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'signal', ?, FALSE, ?)",
+        (user_id, json.dumps(content, ensure_ascii=False), now_iso()),
+    )
+
+
+@app.get("/signals/check")
+async def check_signals(user: dict = Depends(get_current_user)):
+    """Sole Signals (Sprint 3, ersetzt den alten /compass/check komplett -
+    ein gemeinsamer Kanal statt Einzelmechanismen pro Fall, siehe
+    Rückmeldung). Berechnet code-basierte Signale (Stagnation, mehrfach
+    verschobene Aufgaben, positives Muster) bei jedem Aufruf frisch (billig,
+    kein KI-Aufruf), und KI-basierte Signale (Phase-Widerspruch, geparkt-
+    aber-aktiv, Rahmen-Verletzung) höchstens einmal pro Tag. Gibt am Ende
+    MAXIMAL 2 aktive Signale zurück, priorisiert nach severity - bewusst
+    'lieber 1 starkes Signal als 5 kleine'."""
     heute = datetime.now(timezone.utc).date().isoformat()
-
     with get_db() as conn:
-        bestehende = fetch_entries(conn, user["user_id"], "compass_check", limit=5)
-        for entry in bestehende:
-            try:
-                data = json.loads(entry["content"])
-                if data.get("date") == heute:
-                    return data
-            except (json.JSONDecodeError, TypeError):
-                continue
-
         ventures_raw = fetch_entries(conn, user["user_id"], "venture", limit=20)
         alle_tasks = fetch_entries(conn, user["user_id"], "task", limit=300)
-        sieben_tage_alt = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
-        venture_kontext = []
+        # --- 1. Stagnation beim primären Standbein (code-basiert) ---
+        primaeres = None
         for v in ventures_raw:
             try:
                 v_data = json.loads(v["content"])
             except (json.JSONDecodeError, TypeError):
                 continue
-
-            if v_data.get("focus") == "parked":
-                # Bewusst NICHT auf Phase-Widerspruch geprüft (ergibt bei geparkten
-                # Standbeinen keinen Sinn) - aber sehr wohl darauf, ob kürzlich
-                # trotzdem aktiv daran gearbeitet wurde (Briefing Punkt 11).
-                kuerzlich_aktiv = [
-                    t["content"] for t in alle_tasks
-                    if str(t.get("venture_id")) == str(v["id"])
-                    and (t.get("completed_at", "") >= sieben_tage_alt or t.get("created_at", "") >= sieben_tage_alt)
-                ]
-                if kuerzlich_aktiv:
-                    venture_kontext.append(
-                        f"Standbein: {v_data.get('name', '')} (Status: GEPARKT, aber kürzlich aktiv)\n"
-                        + "\n".join(f"- {t}" for t in kuerzlich_aktiv)
-                    )
-                continue
-
-            zugehoerige_tasks = [
-                t["content"] for t in alle_tasks
-                if str(t.get("venture_id")) == str(v["id"]) and t.get("status", "open") == "open"
+            if v_data.get("focus") == "primary":
+                primaeres = (v["id"], v_data)
+                break
+        if primaeres:
+            v_id, v_data = primaeres
+            zehn_tage_alt = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+            kuerzliche_aktivitaet = [
+                t for t in alle_tasks
+                if str(t.get("venture_id")) == str(v_id)
+                and ((t.get("completed_at") or "") >= zehn_tage_alt or (t.get("created_at") or "") >= zehn_tage_alt)
             ]
-            if not zugehoerige_tasks:
+            if not kuerzliche_aktivitaet:
+                _signal_anlegen(
+                    conn, user["user_id"], "stagnation", "wichtig",
+                    f"{v_data.get('name', '')} ist dein primäres Standbein, aber seit mindestens 10 Tagen gab es dort keine Aktivität.",
+                    "Kein neuer oder abgeschlossener Schritt in den letzten 10 Tagen.",
+                    "Ist der Fokus noch richtig, oder ist der nächste Schritt gerade zu gross?",
+                    related_venture_id=v_id,
+                )
+
+            # --- 2. Positives Muster: durchgehender Fortschritt (code-basiert) ---
+            eine_woche_alt = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            zwei_wochen_alt = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            erledigt_woche1 = any(
+                str(t.get("venture_id")) == str(v_id) and (t.get("completed_at") or "") >= eine_woche_alt
+                for t in alle_tasks
+            )
+            erledigt_woche2 = any(
+                str(t.get("venture_id")) == str(v_id)
+                and zwei_wochen_alt <= (t.get("completed_at") or "") < eine_woche_alt
+                for t in alle_tasks
+            )
+            if erledigt_woche1 and erledigt_woche2:
+                _signal_anlegen(
+                    conn, user["user_id"], "positive_pattern", "info",
+                    f"Du machst seit zwei Wochen durchgehend Fortschritt bei {v_data.get('name', '')}.",
+                    "In beiden der letzten zwei Wochen wurde dort mindestens eine Aufgabe abgeschlossen.",
+                    "Das spricht dafür, den Fokus genau so beizubehalten.",
+                    related_venture_id=v_id,
+                )
+
+        # --- 3. Aufgabe mehrfach verschoben (code-basiert) ---
+        for t in alle_tasks:
+            if t.get("status", "open") != "open":
                 continue
-            venture_kontext.append(
-                f"Standbein: {v_data.get('name', '')} (Phase: {v_data.get('phase', 'idee')})\n"
-                + "\n".join(f"- {t}" for t in zugehoerige_tasks)
-            )
+            if (t.get("verschoben_anzahl") or 0) >= 3:
+                _signal_anlegen(
+                    conn, user["user_id"], "task_verschoben", "hinweis",
+                    f"\"{t['content']}\" wurde bereits {t['verschoben_anzahl']}x verschoben.",
+                    "Mehrfache Verschiebung deutet oft darauf hin, dass die Aufgabe zu gross oder falsch priorisiert ist.",
+                    "Sollten wir sie kleiner machen, streichen oder neu priorisieren?",
+                    related_task_id=t["id"],
+                )
 
-        if not venture_kontext:
-            result = {"date": heute, "mismatches": []}
+        # --- 4. KI-basierte Signale (Phase/geparkt/Rahmen) - höchstens 1x/Tag ---
+        schon_geprueft_heute = fetch_entries(conn, user["user_id"], "signals_ai_run", limit=3)
+        bereits_gelaufen = False
+        for e in schon_geprueft_heute:
+            try:
+                if json.loads(e["content"]).get("date") == heute:
+                    bereits_gelaufen = True
+                    break
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if not bereits_gelaufen:
+            sieben_tage_alt = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            venture_kontext = []
+            venture_by_name = {}
+            for v in ventures_raw:
+                try:
+                    v_data = json.loads(v["content"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                venture_by_name[v_data.get("name", "")] = v["id"]
+                if v_data.get("focus") == "parked":
+                    kuerzlich_aktiv = [
+                        t["content"] for t in alle_tasks
+                        if str(t.get("venture_id")) == str(v["id"])
+                        and ((t.get("completed_at") or "") >= sieben_tage_alt or (t.get("created_at") or "") >= sieben_tage_alt)
+                    ]
+                    if kuerzlich_aktiv:
+                        venture_kontext.append(
+                            f"Standbein: {v_data.get('name', '')} (Status: GEPARKT, aber kürzlich aktiv)\n"
+                            + "\n".join(f"- {tx}" for tx in kuerzlich_aktiv)
+                        )
+                    continue
+                zugehoerige_tasks = [
+                    t["content"] for t in alle_tasks
+                    if str(t.get("venture_id")) == str(v["id"]) and t.get("status", "open") == "open"
+                ]
+                if zugehoerige_tasks:
+                    venture_kontext.append(
+                        f"Standbein: {v_data.get('name', '')} (Phase: {v_data.get('phase', 'idee')})\n"
+                        + "\n".join(f"- {tx}" for tx in zugehoerige_tasks)
+                    )
+
+            profile_rows = fetch_entries(conn, user["user_id"], "profile", limit=1)
+            rahmen = ""
+            if profile_rows:
+                try:
+                    rahmen = json.loads(profile_rows[0]["content"]).get("rahmen", "")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if rahmen:
+                heute_datum = datetime.now(timezone.utc).date()
+                montag = (heute_datum - timedelta(days=heute_datum.weekday())).isoformat()
+                sonntag = (heute_datum + timedelta(days=6 - heute_datum.weekday())).isoformat()
+                diese_woche_faellig = [
+                    t["content"] for t in alle_tasks
+                    if t.get("due_date") and montag <= t["due_date"] <= sonntag and t.get("status", "open") == "open"
+                ]
+                venture_kontext.append(f"Rahmen: {rahmen}\nDiese Woche geplant:\n" + "\n".join(f"- {tx}" for tx in diese_woche_faellig))
+
+            if venture_kontext:
+                kontext = "\n\n".join(venture_kontext)
+                raw = await call_claude(SOLE_SIGNALS_AI_PROMPT, [{"role": "user", "content": kontext}])
+                try:
+                    parsed = extract_json_object(raw)
+                    ki_signale = parsed.get("signale", [])
+                except (json.JSONDecodeError, AttributeError):
+                    ki_signale = []
+                for s in ki_signale if isinstance(ki_signale, list) else []:
+                    if not isinstance(s, dict) or not s.get("message"):
+                        continue
+                    _signal_anlegen(
+                        conn, user["user_id"], s.get("signal_type", "sonstig"), "hinweis",
+                        s["message"], s.get("reason", ""), s.get("recommended_action", ""),
+                        related_venture_id=venture_by_name.get(s.get("standbein_name")),
+                    )
             run_write(
-                conn,
-                "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'compass_check', ?, FALSE, ?)",
-                (user["user_id"], json.dumps(result, ensure_ascii=False), now_iso()),
+                conn, "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'signals_ai_run', ?, FALSE, ?)",
+                (user["user_id"], json.dumps({"date": heute}), now_iso()),
             )
-            return result
 
-        kontext = "\n\n".join(venture_kontext)
-        raw = await call_claude(COMPASS_CHECK_PROMPT, [{"role": "user", "content": kontext}])
+        # --- Ergebnis: alle aktiven Signale, priorisiert, max. 2 ---
+        alle_signale = fetch_entries(conn, user["user_id"], "signal", limit=200)
+        aktiv = []
+        for entry in alle_signale:
+            try:
+                s = json.loads(entry["content"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not s.get("resolved_at"):
+                s["id"] = entry["id"]
+                aktiv.append(s)
+        prioritaet = {"wichtig": 0, "hinweis": 1, "info": 2}
+        aktiv.sort(key=lambda s: prioritaet.get(s.get("severity"), 3))
+        return {"signale": aktiv[:2]}
+
+
+class SignalResolveIn(BaseModel):
+    signal_id: int
+
+
+@app.post("/signals/resolve")
+def resolve_signal(body: SignalResolveIn, user: dict = Depends(get_current_user)):
+    """Markiert ein Signal als aufgelöst (Person hat's besprochen/erledigt/
+    weggeklickt) - verhindert über die Abkühlfrist in _signal_existiert_aktiv,
+    dass es sofort wieder auftaucht."""
+    with get_db() as conn:
+        rows = run_query(conn, "SELECT * FROM entries WHERE id = ? AND user_id = ? AND type = 'signal'", (body.signal_id, user["user_id"]))
+        if not rows:
+            raise HTTPException(status_code=404, detail="Signal nicht gefunden")
         try:
-            parsed = extract_json_object(raw)
-            mismatches = parsed.get("mismatches", [])
-        except (json.JSONDecodeError, AttributeError):
-            mismatches = []
-
-        result = {"date": heute, "mismatches": mismatches if isinstance(mismatches, list) else []}
+            content = json.loads(rows[0]["content"])
+        except (json.JSONDecodeError, TypeError):
+            raise HTTPException(status_code=500, detail="Signal beschädigt")
+        content["resolved_at"] = now_iso()
         run_write(
-            conn,
-            "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'compass_check', ?, FALSE, ?)",
-            (user["user_id"], json.dumps(result, ensure_ascii=False), now_iso()),
+            conn, "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
+            (json.dumps(content, ensure_ascii=False), body.signal_id, user["user_id"]),
         )
-        return result
+        return {"ok": True}
 
 
 WEEKLY_REVIEW_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person hat um einen Wochenrückblick \
