@@ -944,6 +944,12 @@ das Angebot und sehen sie genug Wert darin?"
 potenziellen Kunden führen"
   "signal": woran erkennbar ist, wie die Frage beantwortet wurde - ein möglichst konkretes, \
 beobachtbares Kriterium, z.B. "Mindestens 2 von 5 wollen konkret ein Folgegespräch"
+  "sole_einschaetzung_aktuell": deine LAUFENDE strategische Einschätzung, was aus diesem Test gerade \
+folgt - z.B. "Noch nicht am Branding weiterarbeiten, erst die Nachfrage prüfen - das hat jetzt \
+Priorität." Bewusst ein ANDERES Feld als "warum": "warum" begründet, weshalb genau dieser Test \
+gewählt wurde (rückblickend). "sole_einschaetzung_aktuell" ist deine aktuelle Einordnung, was das für \
+das Vorgehen gerade bedeutet (vorausschauend) - beides kann gleichzeitig gefüllt sein, verwechsle sie \
+nicht.
   FALSCH, NICHT ALS TEST EINTRAGEN: "USP schärfen", "Website bauen", "Zielgruppe definieren", \
 "Konzept ausarbeiten" - das ist Arbeit/Vorbereitung, kein Test, weil es kein Ergebnis gibt, an dem \
 sich etwas validiert oder widerlegt. Wenn die Person sowas als "nächsten Schritt" nennt: das gehört \
@@ -1142,7 +1148,7 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
     "meilensteine": [
       {"text": "ein ERREICHTES ODER ANGESTREBTES ERGEBNIS, z.B. 'Erster zahlender Kunde' oder '4k CHF/Monat erreicht' - KEINE Aktivität/Test, sondern ein Zustand", "datum": "2026-08-25 oder null", "messgroesse": "optional", "warum": "kurz, warum genau dieser Meilenstein wichtig ist - optional"}
     ],
-    "aktueller_test": {"frage": "die konkrete Unsicherheit, die geklärt werden soll, z.B. 'Verstehen potenzielle Kunden das Angebot?'", "handlung": "die Aktivität, mit der geprüft wird, z.B. '5 Gespräche mit potenziellen Kunden führen'", "signal": "woran die Antwort erkennbar ist, z.B. 'Mindestens 2 von 5 wollen ein Folgegespräch'", "warum": "kurz, warum genau dieser Test - optional", "datum": null}
+    "aktueller_test": {"frage": "die konkrete Unsicherheit, die geklärt werden soll, z.B. 'Verstehen potenzielle Kunden das Angebot?'", "handlung": "die Aktivität, mit der geprüft wird, z.B. '5 Gespräche mit potenziellen Kunden führen'", "signal": "woran die Antwort erkennbar ist, z.B. 'Mindestens 2 von 5 wollen ein Folgegespräch'", "warum": "kurz, warum genau dieser Test - optional", "sole_einschaetzung_aktuell": "laufende strategische Einordnung, was daraus gerade folgt - optional", "datum": null}
   }
 }
 Falls sich aus dem Gespräch ein erster oder aktualisierter Compass-Entwurf ergibt, statt null:
@@ -2197,6 +2203,12 @@ def _standbein_aktueller_test_setzen(v_data: dict, neuer_test: dict) -> dict:
         "signal": neuer_test.get("signal", ""),
         "text": frage,  # abwärtskompatibel - siehe Docstring
         "warum": neuer_test.get("warum", ""),
+        # Bewusst getrenntes Feld (Korrektur nach Rückmeldung) - "warum"
+        # begründet die Wahl des Tests, dieses Feld ist Soles LAUFENDE
+        # strategische Einschätzung, was daraus gerade folgt. Unterschiedliche
+        # Bedeutung, deshalb kein wiederverwendetes Feld, das je nach
+        # Anzeigeort etwas anderes bedeutet hätte.
+        "sole_einschaetzung_aktuell": neuer_test.get("sole_einschaetzung_aktuell", ""),
         "datum": neuer_test.get("datum"),
     }
     return v_data
@@ -3772,6 +3784,7 @@ class TestIn(BaseModel):
     handlung: str = ""
     signal: str = ""
     warum: str = ""
+    sole_einschaetzung_aktuell: str = ""
     datum: Optional[str] = None
 
 
