@@ -936,28 +936,47 @@ Felder mit unterschiedlicher Bedeutung, keine Synonyme.
 zahlender Kunde", "4k CHF/Monat erreicht", "Angebot & Pricing definiert". Ein Standbein hat mehrere \
 geordnete Meilensteine (die Journey). Jeder hat "status": "erreicht" oder "offen" - trag NIE selbst \
 "aktuell" ein, das wird automatisch aus dem ersten offenen Meilenstein abgeleitet.
-  AKTUELLER TEST ("aktueller_test"): die AKTIVITÄT/das Experiment, mit dem GERADE eine Annahme \
-geprüft oder der nächste Meilenstein vorbereitet wird, z.B. "3-5 Explorationsgespräche führen". Es \
-gibt zu jedem Zeitpunkt höchstens EINEN aktuellen Test pro Standbein - ein neuer "aktueller_test" \
-ERSETZT den alten (der alte bleibt intern nachvollziehbar, das übernimmt das Backend automatisch).
-  Merksatz: Meilenstein = WAS erreicht sein soll. Test = WIE gerade geprüft wird, ob's dahin geht.
+  AKTUELLER TEST ("aktueller_test"): KEIN freier Aktivitätstext mehr, sondern drei getrennte Felder \
+- ein Test ist erst dann ein echter Test, wenn alle drei beantwortet sind:
+  "frage": die konkrete Unsicherheit, die geklärt werden soll, z.B. "Verstehen potenzielle Kunden \
+das Angebot und sehen sie genug Wert darin?"
+  "handlung": die konkrete Aktivität, mit der die Frage geprüft wird, z.B. "5 Gespräche mit \
+potenziellen Kunden führen"
+  "signal": woran erkennbar ist, wie die Frage beantwortet wurde - ein möglichst konkretes, \
+beobachtbares Kriterium, z.B. "Mindestens 2 von 5 wollen konkret ein Folgegespräch"
+  FALSCH, NICHT ALS TEST EINTRAGEN: "USP schärfen", "Website bauen", "Zielgruppe definieren", \
+"Konzept ausarbeiten" - das ist Arbeit/Vorbereitung, kein Test, weil es kein Ergebnis gibt, an dem \
+sich etwas validiert oder widerlegt. Wenn die Person sowas als "nächsten Schritt" nennt: das gehört \
+in "neue_aufgaben", nicht in "aktueller_test". Frag im Zweifel nach, statt eine Aufgabe fälschlich \
+als Test einzutragen.
+  Es gibt zu jedem Zeitpunkt höchstens EINEN aktuellen Test pro Standbein - ein neuer \
+"aktueller_test" ERSETZT den alten (der alte bleibt intern nachvollziehbar, das übernimmt das \
+Backend automatisch).
+  Merksatz: Meilenstein = WAS erreicht sein soll. Test = WELCHE FRAGE gerade beantwortet wird, WIE, \
+und WORAN man die Antwort erkennt.
 - MEILENSTEIN ODER TEST AUCH EIGENSTÄNDIG VORSCHLAGEN DÜRFEN: du musst nicht auf eine grosse \
 Standbein-Änderung warten. Wenn für ein BEREITS BEKANNTES Standbein aus dem Gespräch ein sinnvoller \
-nächster Meilenstein ODER ein neuer aktueller Test erkennbar wird (auch wenn sich sonst nichts \
-ändert), trag "standbein_update" mit nur "name" und dem jeweiligen Feld ein - der Rest bleibt \
-unverändert. Meilensteine sind Ergebnisse ("Erster zahlender Kunde"), keine Aufgaben ("Angebot \
-verschicken" gehört zu den Aufgaben in "neue_aufgaben", nicht hierher).
-- SPRACHE GEGENÜBER DER PERSON: sprich in "antwort" natürlich von "Meilenstein" oder "Test" - beides \
-sind jetzt echte, unterschiedliche Konzepte, kein reines Sprachlabel mehr. Nicht "Beweis" verwenden.
-- WENN DU EINEN TEST VORSCHLÄGST, BEGRÜNDE IHN UND ZEIG DIE KONSEQUENZ: ein guter Test beantwortet \
-nicht nur "was", sondern auch "warum genau das" und "was passiert je nach Ergebnis". Nutze dafür \
-"warum" bei "aktueller_test", und wenn die Person schon erkennbar unterschiedliche Konsequenzen je \
-nach Testausgang durchdacht hat, trag das in "entscheidungsbaum" ein: \
+nächster Meilenstein ODER ein neuer aktueller Test (mit allen drei Feldern) erkennbar wird (auch \
+wenn sich sonst nichts ändert), trag "standbein_update" mit nur "name" und dem jeweiligen Feld ein - \
+der Rest bleibt unverändert. Meilensteine sind Ergebnisse ("Erster zahlender Kunde"), keine Aufgaben \
+("Angebot verschicken" gehört zu den Aufgaben in "neue_aufgaben", nicht hierher).
+- SPRACHE GEGENÜBER DER PERSON: sprich in "antwort" natürlich davon, was ihr "herausfinden" wollt, \
+nicht technisch von "Test" (das Wort ist Lean-Startup-Jargon, den die Person nicht lernen muss) - \
+z.B. "Lass uns rausfinden, ob..." statt "Ich schlage folgenden Test vor". Auch nicht "Beweis" \
+verwenden.
+- WENN DU EINEN TEST VORSCHLÄGST, BEGRÜNDE IHN UND ZEIG DIE KONSEQUENZ: nutze "warum" bei \
+"aktueller_test" für die kurze Begründung, und wenn die Person schon erkennbar unterschiedliche \
+Konsequenzen je nach Testausgang durchdacht hat, trag das in "entscheidungsbaum" ein: \
 {"wenn_bestaetigt": "...", "wenn_unklar": "...", "wenn_negativ": "..."} - nur wenn das wirklich aus \
 dem Gespräch hervorgeht, nicht erfinden.
-- WENN EIN TEST ABGESCHLOSSEN WIRD: prüfe anschliessend aktiv, ob der jetzt aktuelle (nächste offene) \
-Meilenstein strategisch noch sinnvoll ist, und schlage bei Bedarf eine Änderung vor - nicht einfach \
-stillschweigend weitermachen.
+- WENN EIN TEST ABGESCHLOSSEN WIRD: das darf NIE nur "erledigt" bedeuten. Frag aktiv nach: "Was ist \
+dabei rausgekommen?" Sobald die Person das Ergebnis beschreibt, trag "test_ergebnis" ein: \
+{"venture_name": "...", "ergebnis": "kurze, konkrete Zusammenfassung dessen, was tatsächlich \
+passiert ist - Zahlen/Fakten, keine Interpretation", "sole_einschaetzung": "was das für die \
+ursprüngliche Frage bedeutet - bestätigt/widerlegt/uneindeutig, mit Begründung", "empfehlung": \
+"was als Nächstes sinnvoll ist - neuer Test, angepasster Kurs, oder weiter wie geplant"}. Prüfe \
+danach aktiv, ob der jetzt aktuelle (nächste offene) Meilenstein strategisch noch sinnvoll ist, und \
+schlage bei Bedarf eine Änderung vor - nicht einfach stillschweigend weitermachen.
 - ANNAHMEN FESTHALTEN: wenn im Gespräch klar wird, dass eine Empfehlung auf unbewiesenen Annahmen \
 beruht (z.B. "Unternehmen haben dieses Problem", "sie sind bereit, dafür zu bezahlen") - trag diese \
 kurz und stichpunktartig in "annahmen" ein (Liste). Das macht sichtbar, worauf eine Einschätzung \
@@ -1123,7 +1142,7 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
     "meilensteine": [
       {"text": "ein ERREICHTES ODER ANGESTREBTES ERGEBNIS, z.B. 'Erster zahlender Kunde' oder '4k CHF/Monat erreicht' - KEINE Aktivität/Test, sondern ein Zustand", "datum": "2026-08-25 oder null", "messgroesse": "optional", "warum": "kurz, warum genau dieser Meilenstein wichtig ist - optional"}
     ],
-    "aktueller_test": {"text": "die AKTUELLE Aktivität/das Experiment, mit dem gerade eine Annahme geprüft oder der nächste Meilenstein vorbereitet wird, z.B. '3-5 Explorationsgespräche führen' - KEIN Ergebnis-Zustand, sondern eine Tätigkeit", "warum": "kurz, warum genau dieser Test - optional", "datum": null}
+    "aktueller_test": {"frage": "die konkrete Unsicherheit, die geklärt werden soll, z.B. 'Verstehen potenzielle Kunden das Angebot?'", "handlung": "die Aktivität, mit der geprüft wird, z.B. '5 Gespräche mit potenziellen Kunden führen'", "signal": "woran die Antwort erkennbar ist, z.B. 'Mindestens 2 von 5 wollen ein Folgegespräch'", "warum": "kurz, warum genau dieser Test - optional", "datum": null}
   }
 }
 Falls sich aus dem Gespräch ein erster oder aktualisierter Compass-Entwurf ergibt, statt null:
@@ -2045,7 +2064,7 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> dict:
                 })
         v_data["meilensteine"] = bestehende_meilensteine
         v_data["umsatz"] = normalize_umsatz(v_data.get("umsatz"))
-        if isinstance(neuer_test, dict) and neuer_test.get("text"):
+        if isinstance(neuer_test, dict) and (neuer_test.get("frage") or neuer_test.get("text")):
             alter_test_vor_wechsel = v_data.get("aktueller_test")
             if isinstance(alter_test_vor_wechsel, dict) and alter_test_vor_wechsel.get("id"):
                 alte_test_id = alter_test_vor_wechsel["id"]
@@ -2097,7 +2116,7 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> dict:
                 for m in neue_meilensteine if isinstance(m, dict)
             ],
         }
-        if isinstance(neuer_test, dict) and neuer_test.get("text"):
+        if isinstance(neuer_test, dict) and (neuer_test.get("frage") or neuer_test.get("text")):
             neues_venture = _standbein_aktueller_test_setzen(neues_venture, neuer_test)
         run_write(
             conn,
@@ -2107,19 +2126,76 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> dict:
     return {"success": True, "orphaned_tasks": orphaned_tasks}
 
 
+def apply_test_ergebnis(conn, user_id: int, test_ergebnis: dict) -> bool:
+    """Verarbeitet 'test_ergebnis' aus dem Chat (Korrektur nach Rückmeldung -
+    'Test abschliessen' bedeutete vorher nur Archivieren, nie ein festgehaltenes
+    Ergebnis). Findet den ZULETZT abgeschlossenen Test in test_historie für das
+    genannte Standbein, der noch KEIN Ergebnis hat (das ist der, über den gerade
+    gesprochen wird - 'Test abschliessen' archiviert ihn zuerst ohne Ergebnis,
+    das Gespräch danach liefert es nach), und ergänzt ihn dort."""
+    if not isinstance(test_ergebnis, dict) or not test_ergebnis.get("venture_name"):
+        return False
+
+    v_id, _ = resolve_standbein_reference(conn, user_id, test_ergebnis["venture_name"])
+    if not v_id:
+        return False
+
+    rows = run_query(conn, "SELECT * FROM entries WHERE id = ? AND user_id = ? AND type = 'venture'", (v_id, user_id))
+    if not rows:
+        return False
+    try:
+        v_data = json.loads(rows[0]["content"])
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+    historie = v_data.get("test_historie") or []
+    # Rückwärts suchen (neueste zuerst) nach dem ersten Eintrag ohne Ergebnis -
+    # das ist der zuletzt abgeschlossene, noch unbesprochene Test.
+    ziel_index = None
+    for i in range(len(historie) - 1, -1, -1):
+        if isinstance(historie[i], dict) and not historie[i].get("ergebnis"):
+            ziel_index = i
+            break
+    if ziel_index is None:
+        return False
+
+    historie[ziel_index]["ergebnis"] = test_ergebnis.get("ergebnis", "")
+    historie[ziel_index]["sole_einschaetzung"] = test_ergebnis.get("sole_einschaetzung", "")
+    historie[ziel_index]["empfehlung"] = test_ergebnis.get("empfehlung", "")
+    v_data["test_historie"] = historie
+
+    run_write(
+        conn, "UPDATE entries SET content = ? WHERE id = ? AND user_id = ?",
+        (json.dumps(v_data, ensure_ascii=False), v_id, user_id),
+    )
+    return True
+
+
 def _standbein_aktueller_test_setzen(v_data: dict, neuer_test: dict) -> dict:
     """Setzt einen neuen aktuellen Test - der bisherige (falls vorhanden) wird
     NICHT überschrieben/verworfen, sondern in 'test_historie' archiviert, damit
     Tasks, die an die alte test_id gebunden sind, weiterhin nachvollziehbar
-    bleiben (Briefing: 'Test sollte historisch nachvollziehbar bleiben')."""
+    bleiben (Briefing: 'Test sollte historisch nachvollziehbar bleiben').
+
+    Erweitert (Korrektur nach Rückmeldung): ein Test ist jetzt strenger als
+    Frage + Handlung + Signal strukturiert, nicht nur ein freier Text, der
+    leicht zu blosser Arbeit/Vorbereitung wird ('USP schärfen' ist kein Test -
+    es gibt kein Ergebnis, an dem sich etwas validiert oder widerlegt). `text`
+    bleibt trotzdem gepflegt (= die Frage, falls vorhanden, sonst wie bisher)
+    - viele bestehende Stellen im Code lesen nur `text` für eine kompakte
+    Anzeige, das absichtlich nicht überall auf einmal umgestellt."""
     alter_test = v_data.get("aktueller_test")
     if isinstance(alter_test, dict) and alter_test.get("id"):
         historie = v_data.get("test_historie") or []
         historie.append({**alter_test, "abgeschlossen_am": now_iso()})
         v_data["test_historie"] = historie
+    frage = neuer_test.get("frage") or neuer_test.get("text", "")
     v_data["aktueller_test"] = {
         "id": secrets.token_hex(4),
-        "text": neuer_test.get("text", ""),
+        "frage": frage,
+        "handlung": neuer_test.get("handlung", ""),
+        "signal": neuer_test.get("signal", ""),
+        "text": frage,  # abwärtskompatibel - siehe Docstring
         "warum": neuer_test.get("warum", ""),
         "datum": neuer_test.get("datum"),
     }
@@ -2614,6 +2690,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         synthese = parsed.get("synthese")  # nur aus dem Onboarding-Deep-Dive
         was_testen = parsed.get("was_testen")
         vision_vorschlag = parsed.get("vision_vorschlag")
+        test_ergebnis = parsed.get("test_ergebnis")
     except (json.JSONDecodeError, AttributeError):
         # Falls das Parsen fehlschlägt, nutzen wir die Rohantwort ohne Extraktion,
         # damit der Chat trotzdem funktioniert, statt komplett zu scheitern.
@@ -2630,6 +2707,7 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
         synthese = None
         was_testen = None
         vision_vorschlag = None
+        test_ergebnis = None
 
     # Kern-Antwort IMMER sichern und zurückgeben, auch wenn danach beim
     # Speichern von Aufgaben/Standbein/Profil etwas schiefgeht - eine bereits
@@ -2736,6 +2814,14 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                         "payload": entscheidung_vorschlag,
                     })
 
+                if isinstance(test_ergebnis, dict) and test_ergebnis.get("venture_name") and test_ergebnis.get("ergebnis"):
+                    vorschlaege.append({
+                        "kind": "test_ergebnis",
+                        "label": f"Gelernt bei {test_ergebnis['venture_name']}: {test_ergebnis['ergebnis']}",
+                        "payload": test_ergebnis,
+                        "begruendung": test_ergebnis.get("sole_einschaetzung", ""),
+                    })
+
                 # Aus dem Onboarding-Deep-Dive: mehrere Synthese-Hypothesen auf einmal,
                 # jede einzeln bestätigbar/korrigierbar (Briefing Punkt 7).
                 if isinstance(synthese, list):
@@ -2781,6 +2867,9 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                         f"'{o['new_test_text']}' geändert. {len(o['task_ids'])} noch offene Aufgabe(n) "
                         f"hingen am alten Test - sollten geprüft werden, ob sie weiterhin relevant sind."
                     )
+
+                if apply_test_ergebnis(conn, user["user_id"], test_ergebnis):
+                    standbein_gespeichert = True
 
                 if isinstance(profil_update, dict) and profil_update:
                     save_profile_merged(conn, user["user_id"], profil_update)
@@ -2857,6 +2946,8 @@ def confirm_suggestion(body: SuggestionConfirmIn, user: dict = Depends(get_curre
             create_hypothesis_entry(conn, user["user_id"], body.payload)
         elif body.kind == "decision":
             create_decision_entry(conn, user["user_id"], body.payload)
+        elif body.kind == "test_ergebnis":
+            apply_test_ergebnis(conn, user["user_id"], body.payload)
         elif body.kind == "vision":
             run_write(
                 conn,
@@ -3676,7 +3767,10 @@ class MeilensteinIn(BaseModel):
 
 class TestIn(BaseModel):
     id: str = ""
-    text: str
+    text: str = ""
+    frage: str = ""
+    handlung: str = ""
+    signal: str = ""
     warum: str = ""
     datum: Optional[str] = None
 
