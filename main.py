@@ -37,6 +37,7 @@ import bcrypt
 import httpx
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -120,6 +121,13 @@ if USE_POSTGRES:
             """)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS calendar_token TEXT")
+            # E-Mail-Änderung mit Bestätigung: die neue Adresse wird erst nach
+            # Klick auf den Bestätigungslink wirksam, die alte bleibt bis dahin
+            # aktiv (Korrektur nach Rückmeldung - verhindert Aussperren bei
+            # Tippfehlern und bestätigt, dass die neue Adresse wirklich erreichbar ist).
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_email TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_email_token TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_email_created_at TEXT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS entries (
                     id SERIAL PRIMARY KEY,
@@ -214,7 +222,10 @@ else:
                     created_at TEXT NOT NULL
                 )
             """)
-            for col_def in ["approved INTEGER DEFAULT 0", "calendar_token TEXT"]:
+            for col_def in [
+                "approved INTEGER DEFAULT 0", "calendar_token TEXT",
+                "pending_email TEXT", "pending_email_token TEXT", "pending_email_created_at TEXT",
+            ]:
                 try:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {col_def}")
                 except sqlite3.OperationalError:
@@ -305,6 +316,7 @@ class EntryUpdate(BaseModel):
     clear_deadline: bool = False
     estimated_minutes: Optional[int] = None
     venture_id: Optional[int] = None
+    clear_venture_id: bool = False  # explizit auf "kein Standbein" zurücksetzen
     milestone_text: Optional[str] = None
     sole_priority: Optional[int] = None
     priority_reason: Optional[str] = None
@@ -339,6 +351,12 @@ class SignupIn(BaseModel):
 class LoginIn(BaseModel):
     email: str
     password: str
+
+
+class ChangeEmailIn(BaseModel):
+    new_email: str
+    password: str  # aktuelles Passwort zur Bestätigung - Änderung der Login-
+    # E-Mail ist sicherheitsrelevant, deshalb dieselbe Hürde wie beim Login.
 
 
 # ---------------------------------------------------------------------------
@@ -1344,6 +1362,139 @@ def login(payload: LoginIn):
     return {"token": token, "email": user["email"]}
 
 
+EMAIL_CONFIRM_BASE_URL = "https://weg-backend.onrender.com"
+
+
+def _ist_unique_verletzung(exc: Exception) -> bool:
+    """Erkennt eine UNIQUE-Constraint-Verletzung anhand der Fehlermeldung -
+    funktioniert für SQLite ('UNIQUE constraint failed') und Postgres
+    ('duplicate key value'), ohne DB-spezifische Exception-Typen zu
+    importieren. Andere Fehler (z.B. Verbindungsabbruch) bekommen dadurch
+    eine ehrlichere, andere Meldung statt fälschlich 'schon vergeben'."""
+    text = str(exc).lower()
+    return "unique constraint" in text or "duplicate key" in text
+
+
+@app.post("/account/email/request")
+async def request_email_change(payload: ChangeEmailIn, user: dict = Depends(get_current_user)):
+    """Schritt 1 von 2 (Korrektur nach Rückmeldung - vorher wurde die E-Mail
+    sofort geändert, ohne zu prüfen, ob die neue Adresse überhaupt erreichbar
+    ist. Ein Tippfehler hätte zum Aussperren aus dem eigenen Konto führen
+    können, und Sole hatte keine Bestätigung, dass die Adresse wirklich der
+    Person gehört).
+
+    Speichert die gewünschte neue Adresse nur als 'pending', ändert NICHTS an
+    der aktiven E-Mail. Verschickt einen Bestätigungslink an die NEUE Adresse.
+    Erst ein Klick darauf (siehe /account/email/confirm) macht die Änderung
+    wirksam - die alte Adresse bleibt bis dahin voll aktiv und nutzbar."""
+    neue_email = payload.new_email.strip().lower()
+    if "@" not in neue_email or "." not in neue_email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Das sieht nicht nach einer gültigen E-Mail-Adresse aus.")
+
+    with get_db() as conn:
+        rows = run_query(conn, "SELECT * FROM users WHERE id = ?", (user["user_id"],))
+        if not rows or not verify_password(payload.password, rows[0]["password_hash"]):
+            raise HTTPException(status_code=401, detail="Passwort ist falsch.")
+
+        if neue_email == rows[0]["email"]:
+            raise HTTPException(status_code=400, detail="Das ist bereits deine aktuelle E-Mail-Adresse.")
+
+        token = secrets.token_urlsafe(32)
+        run_write(
+            conn,
+            "UPDATE users SET pending_email = ?, pending_email_token = ?, pending_email_created_at = ? WHERE id = ?",
+            (neue_email, token, now_iso(), user["user_id"]),
+        )
+
+    bestaetigungs_link = f"{EMAIL_CONFIRM_BASE_URL}/account/email/confirm?token={token}"
+    versendet = await send_email(
+        neue_email,
+        "Bestätige deine neue E-Mail-Adresse für Sole.",
+        f"""
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px;">
+          <h2 style="font-family:serif;">Sole.</h2>
+          <p>Du (oder jemand mit Zugriff auf dein Sole-Konto) hat diese Adresse als neue
+          Login-E-Mail angegeben.</p>
+          <p><a href="{bestaetigungs_link}" style="display:inline-block;background:#3E3352;color:#fff;
+          padding:10px 20px;text-decoration:none;border-radius:4px;">Adresse bestätigen</a></p>
+          <p style="font-size:12px;color:#888;">Falls du das nicht warst, kannst du diese E-Mail
+          einfach ignorieren - an deinem Konto ändert sich dadurch nichts.</p>
+        </div>
+        """,
+    )
+    if not versendet:
+        log_error("EMAIL_CONFIRM_SEND_FAILED", f"an {neue_email}", user_id=user["user_id"])
+        raise HTTPException(status_code=502, detail="Bestätigungsmail konnte gerade nicht verschickt werden. Später erneut versuchen.")
+
+    return {"pending_email": neue_email}
+
+
+@app.get("/account/email/confirm", response_class=HTMLResponse)
+async def confirm_email_change(token: str):
+    """Schritt 2 von 2 - wird über den Link in der Bestätigungsmail aufgerufen,
+    nicht von der App selbst (deshalb keine Authentifizierung nötig, der Token
+    selbst ist der Nachweis). Liefert direkt eine kleine HTML-Seite zurück,
+    kein JSON, da hier ein Mail-Client/Browser landet, nicht die Sole-App."""
+    ABGELAUFEN_NACH_STUNDEN = 24
+
+    def seite(titel: str, text: str) -> str:
+        return f"""
+        <html><head><meta charset="utf-8"><title>Sole.</title></head>
+        <body style="font-family:sans-serif;background:#F7F4EE;margin:0;padding:60px 20px;text-align:center;">
+          <div style="max-width:420px;margin:0 auto;">
+            <h1 style="font-family:serif;color:#3E3352;">Sole.</h1>
+            <h2>{titel}</h2>
+            <p style="color:#555;">{text}</p>
+          </div>
+        </body></html>
+        """
+
+    with get_db() as conn:
+        rows = run_query(conn, "SELECT * FROM users WHERE pending_email_token = ?", (token,))
+        if not rows:
+            return HTMLResponse(seite("Link ungültig", "Dieser Bestätigungslink ist nicht (mehr) gültig."), status_code=400)
+
+        eintrag = rows[0]
+        erstellt = datetime.fromisoformat(eintrag["pending_email_created_at"])
+        if datetime.now(timezone.utc) - erstellt.replace(tzinfo=timezone.utc) > timedelta(hours=ABGELAUFEN_NACH_STUNDEN):
+            return HTMLResponse(
+                seite("Link abgelaufen", "Dieser Bestätigungslink ist abgelaufen. Bitte in Sole unter Einstellungen erneut anfordern."),
+                status_code=400,
+            )
+
+        alte_email = eintrag["email"]
+        neue_email = eintrag["pending_email"]
+        try:
+            run_write(
+                conn,
+                "UPDATE users SET email = ?, pending_email = NULL, pending_email_token = NULL, pending_email_created_at = NULL WHERE id = ?",
+                (neue_email, eintrag["id"]),
+            )
+        except Exception as exc:
+            log_error("EMAIL_CONFIRM_FAILED", str(exc), user_id=eintrag["id"])
+            if _ist_unique_verletzung(exc):
+                return HTMLResponse(seite("Adresse bereits vergeben", "Diese E-Mail-Adresse wird inzwischen von einem anderen Konto verwendet."), status_code=409)
+            return HTMLResponse(seite("Etwas ist schiefgelaufen", "Bitte später erneut versuchen."), status_code=500)
+
+    # Reine Sicherheitsinformation an die ALTE Adresse - kein Link nötig, nur
+    # zur Kenntnis, damit die Person es merkt, falls sie das nicht selbst war.
+    # Direkt awaitet statt fire-and-forget: passiert nur einmal pro Wechsel,
+    # ein paar hundert Millisekunden Wartezeit hier sind unproblematisch.
+    await send_email(
+        alte_email,
+        "Die E-Mail-Adresse deines Sole-Kontos wurde geändert",
+        f"""
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px;">
+          <h2 style="font-family:serif;">Sole.</h2>
+          <p>Die Login-E-Mail deines Kontos wurde soeben auf <strong>{neue_email}</strong> geändert.</p>
+          <p style="font-size:12px;color:#888;">Falls das nicht du warst, wende dich bitte umgehend an den Support.</p>
+        </div>
+        """,
+    )
+
+    return HTMLResponse(seite("E-Mail-Adresse geändert.", f"Deine neue Login-Adresse ist ab sofort {neue_email}."))
+
+
 # ---------------------------------------------------------------------------
 # Endpoints — jeweils mit user = Depends(get_current_user) geschützt,
 # jede Anfrage ist automatisch auf die Daten der eingeloggten Person beschränkt
@@ -1351,8 +1502,13 @@ def login(payload: LoginIn):
 
 @app.get("/entries")
 def list_entries(type: Optional[str] = None, user: dict = Depends(get_current_user)):
+    # Aufgaben bekommen ein höheres Limit als der 200er-Standard - die "Alle"-
+    # Ansicht im Frontend soll wirklich ALLE zeigen, nicht nach 200 stillschweigend
+    # abschneiden (das war zuvor der Fall, siehe Tracker). Andere Typen (v.a.
+    # Chat-Nachrichten) behalten den niedrigeren Standard als sinnvolle Grenze.
+    limit = 2000 if type == "task" else 200
     with get_db() as conn:
-        return fetch_entries(conn, user["user_id"], type)
+        return fetch_entries(conn, user["user_id"], type, limit=limit)
 
 
 @app.post("/entries")
@@ -1438,7 +1594,13 @@ def update_entry(entry_id: int, update: EntryUpdate, user: dict = Depends(get_cu
                 "UPDATE entries SET estimated_minutes = ? WHERE id = ? AND user_id = ?",
                 (update.estimated_minutes, entry_id, user["user_id"]),
             )
-        if update.venture_id is not None:
+        if update.clear_venture_id:
+            run_write(
+                conn,
+                "UPDATE entries SET venture_id = NULL WHERE id = ? AND user_id = ?",
+                (entry_id, user["user_id"]),
+            )
+        elif update.venture_id is not None:
             run_write(
                 conn,
                 "UPDATE entries SET venture_id = ? WHERE id = ? AND user_id = ?",
@@ -1756,13 +1918,18 @@ def resolve_standbein_reference(conn, user_id: int, standbein_name: Optional[str
 def create_task_entry(
     conn, user_id: int, inhalt: str, faellig_label: Optional[str],
     venture_id: Optional[int] = None, test_id: Optional[str] = None, milestone_id: Optional[str] = None,
+    source: str = "sole_chat",
 ) -> None:
+    """source explizit gesetzt (Korrektur) - ohne das fiel jede von Sole selbst
+    im Chat vorgeschlagene Aufgabe auf den Tabellen-Standardwert 'manual'
+    zurück, wodurch sie später nicht mehr von echten, tatsächlich manuell
+    von der Person eingetragenen Aufgaben unterscheidbar gewesen wäre."""
     due = due_date_from_label(faellig_label)
     run_write(
         conn,
-        """INSERT INTO entries (user_id, type, content, done, due_date, venture_id, test_id, milestone_id, created_at)
-           VALUES (?, 'task', ?, FALSE, ?, ?, ?, ?, ?)""",
-        (user_id, inhalt, due, venture_id, test_id, milestone_id, now_iso()),
+        """INSERT INTO entries (user_id, type, content, done, due_date, venture_id, test_id, milestone_id, source, created_at)
+           VALUES (?, 'task', ?, FALSE, ?, ?, ?, ?, ?, ?)""",
+        (user_id, inhalt, due, venture_id, test_id, milestone_id, source, now_iso()),
     )
 
 
@@ -2110,6 +2277,32 @@ def route_context(message: str, ventures_geparst: list, previous_turns: list) ->
     }
 
 
+def finde_unbemerkte_manuelle_aufgaben(conn, user_id: int, ventures_geparst: list) -> list:
+    """Aufgaben mit source='manual' (echt von der Person selbst eingetragen,
+    nicht von Sole vorgeschlagen - siehe Korrektur bei create_task_entry, die
+    vorher denselben Standardwert nutzte und diese Unterscheidung unmöglich
+    gemacht hätte), die NACH Soles letzter Chat-Antwort angelegt wurden -
+    Sole hatte also noch keine Gelegenheit, darauf einzugehen.
+
+    Ohne bisherige Chat-Antwort (allererstes Gespräch) wird nichts gemeldet,
+    da es noch keinen sinnvollen Vergleichspunkt gibt - das wäre sonst
+    fälschlich JEDE beim Onboarding erwähnte Aufgabe."""
+    letzte_antwort = fetch_entries(conn, user_id, "chat_assistant", limit=1)
+    if not letzte_antwort:
+        return []
+    grenze = letzte_antwort[0]["created_at"]
+    name_by_id = {v_id: v_data.get("name", "") for v_id, v_data in ventures_geparst}
+    alle_tasks = fetch_entries(conn, user_id, "task", limit=200)
+    treffer = []
+    for t in alle_tasks:
+        if t.get("source") != "manual":
+            continue
+        if not t.get("created_at") or t["created_at"] <= grenze:
+            continue
+        treffer.append({"content": t["content"], "venture_name": name_by_id.get(t.get("venture_id"))})
+    return treffer
+
+
 def build_core_context(conn, user_id: int, ventures_geparst: list) -> str:
     """Klein, IMMER dabei, nie themengefiltert. profil.rahmen ist hier bewusst
     Pflicht (nicht optional) - genau das '60-Stunden-Woche'-Beispiel darf durch
@@ -2141,6 +2334,20 @@ def build_core_context(conn, user_id: int, ventures_geparst: list) -> str:
                 f"{v_data.get('phase', 'idee')}]{stand}"
             )
         parts.append("Standbein-Landschaft (kompakt):\n" + "\n".join(zeilen))
+
+    neue_manuelle = finde_unbemerkte_manuelle_aufgaben(conn, user_id, ventures_geparst)
+    if neue_manuelle:
+        zeilen = [
+            f"- {a['content']}" + (f" (Standbein: {a['venture_name']})" if a["venture_name"] else " (keinem Standbein zugeordnet)")
+            for a in neue_manuelle
+        ]
+        parts.append(
+            "Neue, seit deiner letzten Antwort manuell hinzugefügte Aufgaben - geh in deiner "
+            "aktuellen Antwort kurz darauf ein (bevor oder neben der eigentlichen Frage, nicht als "
+            "eigenes langes Thema): bestätige knapp, dass du sie siehst, und falls eine davon nicht "
+            "klar zum aktuellen Fokus oder einem Standbein passt, sprich das als Frage an - ohne die "
+            "Aufgabe selbst zu kritisieren, es geht nur um Einordnung.\n" + "\n".join(zeilen)
+        )
 
     return "\n\n".join(parts)
 
@@ -2457,154 +2664,154 @@ async def chat(payload: ChatIn, user: dict = Depends(get_current_user)):
                 save_profile_merged(conn, user["user_id"], neues_profil)
                 profil_gespeichert = True
 
-        if payload.confirm_mode:
-            # Neues Verhalten: nichts automatisch speichern, nur vorschlagen.
-            for aufgabe in neue_aufgaben:
-                inhalt = aufgabe.get("inhalt", "") if isinstance(aufgabe, dict) else str(aufgabe)
-                faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
-                std_name = aufgabe.get("standbein_name") if isinstance(aufgabe, dict) else None
-                if not inhalt:
-                    continue
-                vorschlaege.append({"kind": "task", "label": inhalt, "payload": {"inhalt": inhalt, "faellig": faellig_label, "standbein_name": std_name}})
+            if payload.confirm_mode:
+                # Neues Verhalten: nichts automatisch speichern, nur vorschlagen.
+                for aufgabe in neue_aufgaben:
+                    inhalt = aufgabe.get("inhalt", "") if isinstance(aufgabe, dict) else str(aufgabe)
+                    faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
+                    std_name = aufgabe.get("standbein_name") if isinstance(aufgabe, dict) else None
+                    if not inhalt:
+                        continue
+                    vorschlaege.append({"kind": "task", "label": inhalt, "payload": {"inhalt": inhalt, "faellig": faellig_label, "standbein_name": std_name}})
 
-            if isinstance(notiz_update, str) and notiz_update.strip():
-                text = notiz_update.strip()
-                vorschlaege.append({"kind": "notiz", "label": text, "payload": {"text": text}})
+                if isinstance(notiz_update, str) and notiz_update.strip():
+                    text = notiz_update.strip()
+                    vorschlaege.append({"kind": "notiz", "label": text, "payload": {"text": text}})
 
-            if isinstance(standbein_update, dict) and standbein_update.get("name"):
-                # Reine Meilenstein-Ergänzung (kein phase/vision-Wechsel) bekommt ein
-                # eigenes Label, damit das Frontend das als "Meilenstein" statt
-                # "Standbein-Änderung" zeigen kann - dieselbe Bestätigungs-Logik dahinter.
-                ist_nur_meilenstein = (
-                    "phase" not in standbein_update and not standbein_update.get("vision")
-                    and standbein_update.get("meilensteine")
-                )
-                if ist_nur_meilenstein:
-                    erster_meilenstein = standbein_update["meilensteine"][0]
-                    label = f"{standbein_update['name']}: {erster_meilenstein.get('text', '')}" if isinstance(erster_meilenstein, dict) else standbein_update["name"]
-                else:
-                    label = f"Standbein: {standbein_update['name']}"
-                vorschlaege.append({
-                    "kind": "milestone" if ist_nur_meilenstein else "standbein",
-                    "label": label,
-                    "payload": standbein_update,
-                })
+                if isinstance(standbein_update, dict) and standbein_update.get("name"):
+                    # Reine Meilenstein-Ergänzung (kein phase/vision-Wechsel) bekommt ein
+                    # eigenes Label, damit das Frontend das als "Meilenstein" statt
+                    # "Standbein-Änderung" zeigen kann - dieselbe Bestätigungs-Logik dahinter.
+                    ist_nur_meilenstein = (
+                        "phase" not in standbein_update and not standbein_update.get("vision")
+                        and standbein_update.get("meilensteine")
+                    )
+                    if ist_nur_meilenstein:
+                        erster_meilenstein = standbein_update["meilensteine"][0]
+                        label = f"{standbein_update['name']}: {erster_meilenstein.get('text', '')}" if isinstance(erster_meilenstein, dict) else standbein_update["name"]
+                    else:
+                        label = f"Standbein: {standbein_update['name']}"
+                    vorschlaege.append({
+                        "kind": "milestone" if ist_nur_meilenstein else "standbein",
+                        "label": label,
+                        "payload": standbein_update,
+                    })
 
-            if isinstance(profil_update, dict) and profil_update:
-                feld_namen = ", ".join(profil_update.keys())
-                vorschlaege.append({
-                    "kind": "profil",
-                    "label": f"Profil aktualisieren ({feld_namen})",
-                    "payload": profil_update,
-                })
+                if isinstance(profil_update, dict) and profil_update:
+                    feld_namen = ", ".join(profil_update.keys())
+                    vorschlaege.append({
+                        "kind": "profil",
+                        "label": f"Profil aktualisieren ({feld_namen})",
+                        "payload": profil_update,
+                    })
 
-            if isinstance(compass_entwurf, dict) and compass_entwurf.get("standbeine"):
-                anzahl = len(compass_entwurf["standbeine"])
-                vorschlaege.append({
-                    "kind": "compass_draft",
-                    "label": f"Compass-Entwurf ({anzahl} Standbein{'e' if anzahl != 1 else ''})",
-                    "payload": compass_entwurf,
-                })
+                if isinstance(compass_entwurf, dict) and compass_entwurf.get("standbeine"):
+                    anzahl = len(compass_entwurf["standbeine"])
+                    vorschlaege.append({
+                        "kind": "compass_draft",
+                        "label": f"Compass-Entwurf ({anzahl} Standbein{'e' if anzahl != 1 else ''})",
+                        "payload": compass_entwurf,
+                    })
 
-            if isinstance(sole_empfehlung, dict) and sole_empfehlung.get("inhalt"):
-                vorschlaege.append({
-                    "kind": "sole_task",
-                    "label": sole_empfehlung["inhalt"],
-                    "payload": {"inhalt": sole_empfehlung["inhalt"], "faellig": sole_empfehlung.get("faellig"), "standbein_name": sole_empfehlung.get("standbein_name")},
-                    "begruendung": sole_empfehlung.get("begruendung", ""),
-                })
+                if isinstance(sole_empfehlung, dict) and sole_empfehlung.get("inhalt"):
+                    vorschlaege.append({
+                        "kind": "sole_task",
+                        "label": sole_empfehlung["inhalt"],
+                        "payload": {"inhalt": sole_empfehlung["inhalt"], "faellig": sole_empfehlung.get("faellig"), "standbein_name": sole_empfehlung.get("standbein_name")},
+                        "begruendung": sole_empfehlung.get("begruendung", ""),
+                    })
 
-            if isinstance(hypothese_vorschlag, dict) and hypothese_vorschlag.get("text"):
-                vorschlaege.append({
-                    "kind": "hypothesis",
-                    "label": hypothese_vorschlag["text"],
-                    "payload": hypothese_vorschlag,
-                    "begruendung": hypothese_vorschlag.get("begruendung", ""),
-                })
+                if isinstance(hypothese_vorschlag, dict) and hypothese_vorschlag.get("text"):
+                    vorschlaege.append({
+                        "kind": "hypothesis",
+                        "label": hypothese_vorschlag["text"],
+                        "payload": hypothese_vorschlag,
+                        "begruendung": hypothese_vorschlag.get("begruendung", ""),
+                    })
 
-            if isinstance(entscheidung_vorschlag, dict) and entscheidung_vorschlag.get("text"):
-                vorschlaege.append({
-                    "kind": "decision",
-                    "label": entscheidung_vorschlag["text"],
-                    "payload": entscheidung_vorschlag,
-                })
+                if isinstance(entscheidung_vorschlag, dict) and entscheidung_vorschlag.get("text"):
+                    vorschlaege.append({
+                        "kind": "decision",
+                        "label": entscheidung_vorschlag["text"],
+                        "payload": entscheidung_vorschlag,
+                    })
 
-            # Aus dem Onboarding-Deep-Dive: mehrere Synthese-Hypothesen auf einmal,
-            # jede einzeln bestätigbar/korrigierbar (Briefing Punkt 7).
-            if isinstance(synthese, list):
-                for hyp in synthese:
-                    if isinstance(hyp, dict) and hyp.get("text"):
-                        vorschlaege.append({
-                            "kind": "hypothesis",
-                            "label": hyp["text"],
-                            "payload": hyp,
-                            "begruendung": hyp.get("begruendung", ""),
-                        })
+                # Aus dem Onboarding-Deep-Dive: mehrere Synthese-Hypothesen auf einmal,
+                # jede einzeln bestätigbar/korrigierbar (Briefing Punkt 7).
+                if isinstance(synthese, list):
+                    for hyp in synthese:
+                        if isinstance(hyp, dict) and hyp.get("text"):
+                            vorschlaege.append({
+                                "kind": "hypothesis",
+                                "label": hyp["text"],
+                                "payload": hyp,
+                                "begruendung": hyp.get("begruendung", ""),
+                            })
 
-            if isinstance(vision_vorschlag, dict) and vision_vorschlag.get("text"):
-                vorschlaege.append({
-                    "kind": "vision",
-                    "label": vision_vorschlag["text"],
-                    "payload": vision_vorschlag,
-                    "begruendung": vision_vorschlag.get("begruendung", ""),
-                })
-        else:
-            # Altes Verhalten, unverändert für das bestehende Frontend:
-            # sofort automatisch speichern.
-            for aufgabe in neue_aufgaben:
-                inhalt = aufgabe.get("inhalt", "") if isinstance(aufgabe, dict) else str(aufgabe)
-                faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
-                if not inhalt:
-                    continue
-                std_name = aufgabe.get("standbein_name") if isinstance(aufgabe, dict) else None
-                v_id, t_id = resolve_standbein_reference(conn, user["user_id"], std_name)
-                create_task_entry(conn, user["user_id"], inhalt, faellig_label, v_id, t_id)
-                erstellte_aufgaben.append(inhalt)
+                if isinstance(vision_vorschlag, dict) and vision_vorschlag.get("text"):
+                    vorschlaege.append({
+                        "kind": "vision",
+                        "label": vision_vorschlag["text"],
+                        "payload": vision_vorschlag,
+                        "begruendung": vision_vorschlag.get("begruendung", ""),
+                    })
+            else:
+                # Altes Verhalten, unverändert für das bestehende Frontend:
+                # sofort automatisch speichern.
+                for aufgabe in neue_aufgaben:
+                    inhalt = aufgabe.get("inhalt", "") if isinstance(aufgabe, dict) else str(aufgabe)
+                    faellig_label = aufgabe.get("faellig") if isinstance(aufgabe, dict) else None
+                    if not inhalt:
+                        continue
+                    std_name = aufgabe.get("standbein_name") if isinstance(aufgabe, dict) else None
+                    v_id, t_id = resolve_standbein_reference(conn, user["user_id"], std_name)
+                    create_task_entry(conn, user["user_id"], inhalt, faellig_label, v_id, t_id)
+                    erstellte_aufgaben.append(inhalt)
 
-            if isinstance(notiz_update, str) and notiz_update.strip():
-                create_notiz_entry(conn, user["user_id"], notiz_update)
+                if isinstance(notiz_update, str) and notiz_update.strip():
+                    create_notiz_entry(conn, user["user_id"], notiz_update)
 
-            standbein_ergebnis = apply_standbein_update(conn, user["user_id"], standbein_update)
-            standbein_gespeichert = standbein_ergebnis["success"]
-            if standbein_ergebnis.get("orphaned_tasks"):
-                o = standbein_ergebnis["orphaned_tasks"]
-                create_notiz_entry(
-                    conn, user["user_id"],
-                    f"Der Test bei {o['venture_name']} wurde von '{o['old_test_text']}' auf "
-                    f"'{o['new_test_text']}' geändert. {len(o['task_ids'])} noch offene Aufgabe(n) "
-                    f"hingen am alten Test - sollten geprüft werden, ob sie weiterhin relevant sind."
-                )
+                standbein_ergebnis = apply_standbein_update(conn, user["user_id"], standbein_update)
+                standbein_gespeichert = standbein_ergebnis["success"]
+                if standbein_ergebnis.get("orphaned_tasks"):
+                    o = standbein_ergebnis["orphaned_tasks"]
+                    create_notiz_entry(
+                        conn, user["user_id"],
+                        f"Der Test bei {o['venture_name']} wurde von '{o['old_test_text']}' auf "
+                        f"'{o['new_test_text']}' geändert. {len(o['task_ids'])} noch offene Aufgabe(n) "
+                        f"hingen am alten Test - sollten geprüft werden, ob sie weiterhin relevant sind."
+                    )
 
-            if isinstance(profil_update, dict) and profil_update:
-                save_profile_merged(conn, user["user_id"], profil_update)
-                profil_gespeichert = True
+                if isinstance(profil_update, dict) and profil_update:
+                    save_profile_merged(conn, user["user_id"], profil_update)
+                    profil_gespeichert = True
 
-            if isinstance(compass_entwurf, dict) and compass_entwurf.get("standbeine"):
-                apply_compass_entwurf(conn, user["user_id"], compass_entwurf)
-                standbein_gespeichert = True
+                if isinstance(compass_entwurf, dict) and compass_entwurf.get("standbeine"):
+                    apply_compass_entwurf(conn, user["user_id"], compass_entwurf)
+                    standbein_gespeichert = True
 
-            if isinstance(sole_empfehlung, dict) and sole_empfehlung.get("inhalt"):
-                v_id, t_id = resolve_standbein_reference(conn, user["user_id"], sole_empfehlung.get("standbein_name"))
-                create_task_entry(conn, user["user_id"], sole_empfehlung["inhalt"], sole_empfehlung.get("faellig"), v_id, t_id)
-                erstellte_aufgaben.append(sole_empfehlung["inhalt"])
+                if isinstance(sole_empfehlung, dict) and sole_empfehlung.get("inhalt"):
+                    v_id, t_id = resolve_standbein_reference(conn, user["user_id"], sole_empfehlung.get("standbein_name"))
+                    create_task_entry(conn, user["user_id"], sole_empfehlung["inhalt"], sole_empfehlung.get("faellig"), v_id, t_id)
+                    erstellte_aufgaben.append(sole_empfehlung["inhalt"])
 
-            if isinstance(hypothese_vorschlag, dict) and hypothese_vorschlag.get("text"):
-                create_hypothesis_entry(conn, user["user_id"], hypothese_vorschlag)
+                if isinstance(hypothese_vorschlag, dict) and hypothese_vorschlag.get("text"):
+                    create_hypothesis_entry(conn, user["user_id"], hypothese_vorschlag)
 
-            if isinstance(entscheidung_vorschlag, dict) and entscheidung_vorschlag.get("text"):
-                create_decision_entry(conn, user["user_id"], entscheidung_vorschlag)
+                if isinstance(entscheidung_vorschlag, dict) and entscheidung_vorschlag.get("text"):
+                    create_decision_entry(conn, user["user_id"], entscheidung_vorschlag)
 
-            if isinstance(synthese, list):
-                for hyp in synthese:
-                    if isinstance(hyp, dict) and hyp.get("text"):
-                        create_hypothesis_entry(conn, user["user_id"], hyp)
+                if isinstance(synthese, list):
+                    for hyp in synthese:
+                        if isinstance(hyp, dict) and hyp.get("text"):
+                            create_hypothesis_entry(conn, user["user_id"], hyp)
 
-            if isinstance(vision_vorschlag, dict) and vision_vorschlag.get("text"):
-                run_write(
-                    conn,
-                    "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'overall_vision', ?, FALSE, ?)",
-                    (user["user_id"], vision_vorschlag["text"], now_iso()),
-                )
+                if isinstance(vision_vorschlag, dict) and vision_vorschlag.get("text"):
+                    run_write(
+                        conn,
+                        "INSERT INTO entries (user_id, type, content, done, created_at) VALUES (?, 'overall_vision', ?, FALSE, ?)",
+                        (user["user_id"], vision_vorschlag["text"], now_iso()),
+                    )
     except Exception as exc:
         # Sekundäre Extraktion (Aufgaben/Standbein/Profil/Compass) fehlgeschlagen -
         # die Chat-Antwort selbst bleibt trotzdem erhalten und wird unten
@@ -2830,14 +3037,16 @@ DAILY_FOCUS_SYSTEM_PROMPT = """Du bist der "Sole."-Mentor. Die Person öffnet ge
 und braucht eine klare, begründete Einschätzung: worauf sollte sie sich HEUTE konzentrieren?
 
 Du bekommst unten den bekannten Kontext (Profil, Vision, Standbeine mit Priorität/Phase/aktuellem \
-Test/aktuellem Stand) sowie alle offenen Aufgaben. Antworte NUR als JSON, ohne zusätzlichen Text:
+Test/aktuellem Stand), alle offenen Aufgaben, sowie - falls vorhanden - den jüngsten tatsächlichen \
+Gesprächsverlauf von heute. Antworte NUR als JSON, ohne zusätzlichen Text:
 {
   "headline": "kurzer, klarer Satz mit Haltung, z.B. 'Heute würde ich Consulting vorziehen.'",
   "reasoning": "1-3 Sätze Begründung, warum genau das gerade zählt - konkret, nicht generisch. Hebe die wichtigste Kernaussage mit **doppelten Sternchen** hervor, z.B. 'Dein nächster Meilenstein ist der **erste zahlende Kunde**.'",
   "empfehlung_text": "die konkrete Handlung, die du empfiehlst - EXAKT der Titel einer unten aufgeführten offenen Aufgabe, ODER ein neuer, noch nicht existierender konkreter nächster Schritt, wenn keine bestehende Aufgabe passt",
   "ist_neue_aufgabe": true wenn "empfehlung_text" NICHT einem bestehenden Aufgaben-Titel entspricht, sonst false,
   "dauer_minuten": realistische Schätzung in Minuten (nur relevant, wenn ist_neue_aufgabe true - z.B. 30, 45, 60),
-  "standbein_name": "Name des betroffenen Standbeins, falls die Empfehlung zu einem gehört - sonst null"
+  "standbein_name": "Name des betroffenen Standbeins, falls die Empfehlung zu einem gehört - sonst null",
+  "nebenbei": "OPTIONAL - wie ein aufmerksamer Chief of Staff, der 'by the way' sagt: EIN kurzer Satz, falls dir aus dem Kontext etwas auffällt, das liegengeblieben ist (eine alte offene Aufgabe ohne Bewegung, ein Thema aus einer früheren Notiz/Entscheidung, das nie weiterverfolgt wurde) und das die Person kurz im Blick haben sollte - NICHT der Hauptfokus, nur ein Nebenbei-Hinweis. Sonst null. Nicht erzwingen - nur wenn wirklich etwas Konkretes aus dem Kontext hervorgeht, kein generischer Reminder"
 }
 
 WICHTIG - GIB IMMER EINE ECHTE EMPFEHLUNG, KEINE RÜCKFRAGE: Nutze die Kette Compass (welches \
@@ -2850,32 +3059,55 @@ absolute Ausnahme, wenn wirklich weder offene Aufgaben noch eine erkennbare Stan
 existieren - dann "headline": "Bevor ich dir etwas empfehle:" und "reasoning": eine gezielte \
 Rückfrage, alle anderen Felder null/false.
 
+Falls ein jüngster Gesprächsverlauf mitgegeben wurde: der spiegelt wider, was die Person zuletzt \
+tatsächlich mit dir besprochen hat - deine Einschätzung sollte dazu konsistent sein, nicht \
+widersprechen (z.B. nicht "leg den Fokus auf X" empfehlen, wenn ihr gerade erst besprochen habt, \
+dass X zurückgestellt wird).
+
 "empfehlung_text" muss bei ist_neue_aufgabe:false EXAKT (Zeichen für Zeichen) einem der unten \
 aufgeführten Aufgaben-Titel entsprechen, sonst ist_neue_aufgabe:true setzen."""
 
 
 @app.get("/dashboard/focus")
 async def get_daily_focus(user: dict = Depends(get_current_user)):
-    """Liefert den strategischen Tages-Fokus — einmal pro Tag generiert, danach aus der DB
-    wiederverwendet (kein neuer KI-Aufruf bei jedem Übersichts-Aufruf). Gibt None zurück, wenn
-    WIRKLICH gar keine offenen Aufgaben existieren (nicht nur keine für heute) - dann zeigt das
-    Frontend den vorgesehenen Leerzustand. Nutzt bewusst ALLE offenen Aufgaben als Grundlage, nicht
-    nur die exakt für heute fälligen - sonst hätte Sole an den meisten Tagen nichts zu empfehlen und
-    würde auf die unerwünschte Rückfrage ausweichen müssen."""
+    """Liefert den strategischen Tages-Fokus.
+
+    Korrektur nach Rückmeldung (wichtiger struktureller Fund, nicht nur ein
+    Detail): vorher wurde EINMAL PRO KALENDERTAG generiert und danach stur
+    wiederverwendet, selbst wenn sich die Person zwischendurch ausführlich
+    mit Sole unterhalten und die Priorität verschoben hatte - die Übersicht
+    zeigte dann tagelang eine veraltete Einschätzung. Jetzt: Neugenerierung
+    auch INNERHALB desselben Tages, sobald seit der letzten Generierung ein
+    neues Chat-Gespräch stattgefunden hat. Zusätzlich bekommt Sole jetzt den
+    tatsächlichen jüngsten Gesprächsverlauf mit, nicht nur strukturierte
+    Daten - vorher kannte die Fokus-Generierung das eigentliche Gespräch gar
+    nicht, nur was Sole daraus als Entscheidung/Hypothese/Notiz extrahiert
+    hatte (und das lief zeitweise nicht mal zuverlässig, siehe Kernfehler-
+    Fix weiter oben im Tracker)."""
     import json
 
     heute = datetime.now(timezone.utc).date().isoformat()
 
     with get_db() as conn:
         bestehende = fetch_entries(conn, user["user_id"], "daily_focus", limit=5)
+        letzte_chat_antwort = fetch_entries(conn, user["user_id"], "chat_assistant", limit=1)
+        letzte_aktivitaet = letzte_chat_antwort[0]["created_at"] if letzte_chat_antwort else None
+
         for entry in bestehende:
             try:
                 data = json.loads(entry["content"])
-                if data.get("date") == heute:
-                    data["entryId"] = entry["id"]
-                    return data
             except (json.JSONDecodeError, TypeError):
                 continue
+            if data.get("date") != heute:
+                continue
+            generiert_am = data.get("generated_at")
+            # Nur wiederverwenden, wenn seit der Generierung KEIN neueres
+            # Gespräch stattgefunden hat - sonst durchfallen und neu
+            # generieren, auch am selben Kalendertag.
+            if not letzte_aktivitaet or not generiert_am or letzte_aktivitaet <= generiert_am:
+                data["entryId"] = entry["id"]
+                return data
+            break
 
         alle_tasks = fetch_entries(conn, user["user_id"], "task", limit=300)
         offene_tasks = [t for t in alle_tasks if t.get("status", "open") == "open"]
@@ -2893,7 +3125,21 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
             f"- {t['content']}" + (f" (fällig: {t['due_date']})" if t.get("due_date") else " (kein Datum gesetzt)")
             for t in offene_tasks
         )
-        kontext = f"{memory}\n\n--- Alle offenen Aufgaben ---\n{aufgaben_liste}"
+
+        # Jüngster tatsächlicher Gesprächsverlauf - vorher fehlte das hier
+        # komplett, die Fokus-Generierung kannte nur strukturierte Daten.
+        alle_turns = fetch_entries_by_types(conn, user["user_id"], ["chat_user", "chat_assistant"], limit=80)
+        relevante_turns = select_relevant_turns(alle_turns, max_active_days=1)
+        relevante_turns = list(reversed(relevante_turns))
+        gespraechs_text = ""
+        if relevante_turns:
+            zeilen = []
+            for t in relevante_turns:
+                rolle = "Person" if t["type"] == "chat_user" else "Sole"
+                zeilen.append(f"{rolle}: {t['content'][:400]}")
+            gespraechs_text = "\n\n--- Jüngster Gesprächsverlauf (heute) ---\n" + "\n".join(zeilen)
+
+        kontext = f"{memory}\n\n--- Alle offenen Aufgaben ---\n{aufgaben_liste}{gespraechs_text}"
 
         raw = await call_claude(DAILY_FOCUS_SYSTEM_PROMPT, [{"role": "user", "content": kontext}])
         try:
@@ -2906,6 +3152,7 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
 
         result = {
             "date": heute,
+            "generated_at": now_iso(),
             "headline": parsed.get("headline", ""),
             "reasoning": parsed.get("reasoning", ""),
             "taskId": passende_task["id"] if passende_task else None,
@@ -2914,6 +3161,7 @@ async def get_daily_focus(user: dict = Depends(get_current_user)):
             "istNeueAufgabe": ist_neu,
             "dauerMinuten": parsed.get("dauer_minuten") if ist_neu else None,
             "standbeinName": parsed.get("standbein_name"),
+            "nebenbei": parsed.get("nebenbei") or None,
         }
         neuer_eintrag_id = run_write(
             conn,
