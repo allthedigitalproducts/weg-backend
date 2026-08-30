@@ -1137,6 +1137,7 @@ Falls ein Standbein wirklich besprochen wurde, statt null:
   "standbein_update": {
     "name": "Name des Standbeins, wie die Person es selbst nennt",
     "vision": "kurze Vision/Zahlen/Ziele, so wie besprochen",
+    "role": "kurze Antwort auf 'warum dieses Standbein' / welche Rolle es im Leben der Person spielt, z.B. 'kurzfristiger Cashflow' - nur wenn im Gespräch wirklich neu oder präzisiert, nicht bei jedem Update wiederholen",
     "phase": "idee | validieren | aufbauen | umsetzen | wachsen (nur falls erkennbar, sonst weglassen)",
     "focus": "primary | secondary | parked (nur falls sich die Priorität im Gespräch wirklich ändert oder ein neues Standbein entsteht - sonst weglassen, nicht bei jedem Standbein-Update mitschicken)",
     "ziel": "was konkret erreicht werden soll (optional, nur wenn klar unterscheidbar von 'vision')",
@@ -2046,6 +2047,8 @@ def apply_standbein_update(conn, user_id: int, standbein_update: dict) -> dict:
             v_data["focus"] = standbein_update["focus"]
         if standbein_update.get("ziel"):
             v_data["ziel"] = standbein_update["ziel"]
+        if standbein_update.get("role"):
+            v_data["role"] = standbein_update["role"]
         if standbein_update.get("aktueller_stand"):
             v_data["aktueller_stand"] = standbein_update["aktueller_stand"]
         if standbein_update.get("annahmen"):
